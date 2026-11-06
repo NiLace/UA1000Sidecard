@@ -1,0 +1,183 @@
+.TH UA1000CTL 1 "November 2026" "ua1000ctl 0.2" "User Commands"
+.SH NAME
+ua1000ctl \- control the mixer, patch bay and panel switches of a UA-1000
+.SH SYNOPSIS
+.B ua1000ctl
+.RI [ option ]...
+.I command
+.RI [ argument ]...
+.SH DESCRIPTION
+.B ua1000ctl
+changes one setting of a Roland/EDIROL UA-1000 audio interface: it updates
+the editor's state, sends the messages that make the device follow, and saves
+the state.
+The state is shared with
+.BR ua1000gui (1).
+.PP
+The device cannot report its mixer settings, so the state holds what the
+editor has set.
+.B status
+prints it.
+.SH OPTIONS
+.TP
+.BR \-p ", " \-\-port " \fIport\fR"
+The ALSA rawmidi port, such as
+.BR hw:2,0,1 .
+By default the port named
+.B "UA-1000 Control"
+is used.
+.TP
+.BR \-s ", " \-\-state " \fIfile\fR"
+The state file (see
+.BR FILES ).
+.TP
+.BR \-n ", " \-\-dry\-run
+Print each message in hexadecimal, one per line, instead of sending it; the
+state file is not changed.
+.TP
+.BR \-h ", " \-\-help
+Show a summary of the commands.
+.TP
+.BR \-V ", " \-\-version
+Show the version.
+.SH COMMANDS
+Channels are numbered 1 to 10; pairs are written
+.BR 1\-2 ,
+.BR 3\-4 ,
+.BR 5\-6 ,
+.BR 7\-8
+and
+.BR 9\-10 .
+.B input
+is the INPUT MONITOR mixer and
+.B output
+the OUTPUT MONITOR mixer.
+.TP
+.BI status
+Print the state the editor knows, in the format of the state file.
+.TP
+.B read
+Ask the device for its state and print it, in the format of the state file:
+the panel switches, the patch bay, and both mixers and MONITOR OUT (gains,
+pans, mutes, links).
+The solos are not read (how the device reports them is not known) and are
+printed off.
+Nothing is sent but the request, and the state file is not changed.
+.TP
+.B ports
+List the MIDI ports, marking the UA-1000.
+.TP
+.B sync
+Send the whole state to the device.
+.TP
+.BR input | output " \fIchannel\fR " gain " \fIdB\fR"
+Set a channel's gain:
+.B \-inf
+(either case)
+or a level in dB up to +12, written in plain decimal (\-6, +1.5, 0.25), with an
+optional
+.B dB
+suffix.
+.TP
+.BR input | output " \fIchannel\fR " pan " \fIposition\fR"
+.BR L20 " .. " L1 ,
+.BR C ,
+.BR R1 " .. " R20 ,
+in either case.
+.TP
+.BR input | output " \fIchannel\fR " mute | solo " " on | off
+.TP
+.BR input | output " \fIpair\fR " link " " on | off
+While a pair is linked, gain, mute and solo set on either channel apply to
+both, and the editor mirrors the pan (the vendor's panel's behaviour there
+was never captured).
+.TP
+.BR "monitor gain" " \fIdB\fR [" left | right ]
+The MONITOR OUT level: both sides, or the side given (while linked, both
+sides follow anyway).
+.TP
+.BR "monitor link" " " on | off
+.TP
+.BR "panel mono" | soft\-ctrl " " on | off
+.TP
+.BR "panel output\-volume" " " main | all
+Whether the OUTPUT VOLUME knob acts on the main outputs or on all of them.
+.TP
+.BR "panel clock" " " internal | ext\-spdif | ext\-adat
+Selecting the ADAT clock also selects the ADAT digital output.
+.TP
+.BR "panel digital\-out" " " spdif | adat
+.TP
+.BR route " " wave\-in | output\-dm\-on | output\-dm\-off " \fIpair source\fR"
+Route a source to what the computer records
+.RB ( wave\-in )
+or to an output, with direct monitor on or all off.
+Sources:
+.BR monitor\-out ,
+.BR input\-1\-2 " .. " input\-9\-10 ,
+.BR wave\-out\-1\-2 " .. " wave\-out\-9\-10 ,
+and for
+.B output\-dm\-off
+also
+.BR same .
+.TP
+.BR "preset wave\-in" " " initial | loop\-back
+.TP
+.BR "preset output" " " initial | hard\-thru | monitor\-out
+.TP
+.BR memory " " store | load " \fIslot\fR [\fIsections\fR]"
+Slots 1 to 5.
+.I sections
+is
+.B all
+(the default) or a comma-separated list of
+.BR panel ,
+.BR wave\-in ,
+.BR output
+and
+.BR monitor .
+Loading a slot the editor did not store leaves the editor's mixer settings
+unknown, and says so; the state file records it
+.RB ( "mixer unknown" ,
+shown by
+.BR status )
+until a
+.B sync
+or a load of a slot the editor stored.
+After a load that includes the panel or the patch bay, the device reports
+them, and the state follows.
+.TP
+.BI user\-set " rate"
+Store the power-on settings: everything as it is now (panel switches, patch
+bay, mixers), at
+.I rate
+Hz (44100, 48000, 88200 or 96000).
+With the SAMPLE RATE switch on USER SET, the device powers up in exactly
+that state.
+.SH EXIT STATUS
+0 on success, 1 when the device or the state file fails (also when another
+program, such as a connected
+.BR ua1000gui ,
+holds the MIDI port), 2 for a command line that is not understood.
+.SH FILES
+.TP
+.I $XDG_STATE_HOME/ua1000/state
+The editor's state, or
+.I ~/.local/state/ua1000/state
+when
+.B XDG_STATE_HOME
+is not set.
+.SH EXAMPLES
+.EX
+ua1000ctl input 1 gain \-6
+ua1000ctl output 3\-4 link on
+ua1000ctl route wave\-in 1\-2 monitor\-out
+ua1000ctl \-n panel mono on
+.EE
+.SH NOTES
+The device listens on USB-MIDI cable 1; the kernel's
+.B snd\-ua101
+driver must address that cable for any of this to reach it.
+.SH SEE ALSO
+.BR ua1000gui (1),
+.BR amidi (1)

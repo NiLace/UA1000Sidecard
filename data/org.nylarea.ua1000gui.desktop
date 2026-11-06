@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=UA-1000 Sidecard
+Comment=Mixer, patch bay and panel switches of the Roland/EDIROL UA-1000
+Exec=ua1000gui
+Icon=org.nylarea.ua1000gui
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;

@@ -1,0 +1,81 @@
+.TH UA1000GUI 1 "November 2026" "ua1000gui 0.2" "User Commands"
+.SH NAME
+ua1000gui \- control panel for the UA-1000
+.SH SYNOPSIS
+.B ua1000gui
+.RB [ \-p
+.IR port ]
+.RB [ \-s
+.IR file ]
+.br
+.B ua1000gui
+.BR \-h | \-V
+.SH DESCRIPTION
+.B ua1000gui
+shows and changes the settings of a Roland/EDIROL UA-1000 audio interface:
+the INPUT MONITOR and OUTPUT MONITOR mixers, the MONITOR OUT level, the
+front-panel switches and, from the
+.B Device
+menu, the patch bay, the memories and the USER SET (the power-on settings,
+including the sample rate).
+.PP
+Faders move through the same 1023 positions as the vendor's panel and show
+their value in dB; they respond to the keyboard and the scroll wheel.
+.PP
+When it connects, the panel asks the device for its settings and shows
+them; it keeps them in the state file it shares with
+.BR ua1000ctl (1),
+with the solos and the memories it stored, which the device cannot report,
+and follows changes that
+.B ua1000ctl
+makes while it is open.
+If the device does not answer, the saved state is sent to it.
+.SH OPTIONS
+.TP
+.BR \-p ", " \-\-port " \fIport\fR"
+The ALSA rawmidi port; by default the port named
+.B "UA-1000 Control"
+is used.
+.TP
+.BR \-s ", " \-\-state " \fIfile\fR"
+The state file.
+.TP
+.BR \-h ", " \-\-help
+Show the options.
+.TP
+.BR \-V ", " \-\-version
+Show the version.
+.SH MENU
+.TP
+.B Patch Bay\(fm
+The routing tables and their presets.
+.TP
+.B Notes\(fm
+A notepad for what is wired where, saved beside the state file.
+.TP
+.B Send All Settings
+Send the whole state to the device.
+.TP
+.B Reconnect
+Look for the device again.
+.TP
+.BR "Store Memory\(fm" ", " "Load Memory\(fm" ", " "Store USER SET\(fm"
+The device's five memories and its power-on settings; offered only while
+the device is connected.
+.TP
+.B Reset to Defaults\(fm
+Every channel to 0 dB and on; OUTPUT 1\-10 and INPUT 9\-10 as linked stereo pairs (odd left, even right), INPUT 1\-8 centred; the panel and patch bay to their
+initial settings.
+.TP
+.B Quit
+Also Ctrl+Q.
+.SH FILES
+.TP
+.I $XDG_STATE_HOME/ua1000/state
+The editor's state, or
+.I ~/.local/state/ua1000/state
+when
+.B XDG_STATE_HOME
+is not set.
+.SH SEE ALSO
+.BR ua1000ctl (1)

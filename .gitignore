@@ -1,0 +1,4 @@
+ua1000ctl
+ua1000gui
+*.o
+kernel/build-*/

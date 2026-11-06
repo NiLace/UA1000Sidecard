@@ -1,0 +1,72 @@
+From a095644adeabcc3bfe85acacb15ece872eaa71dd Mon Sep 17 00:00:00 2001
+From: NiLace <nilace@nylarea.com>
+Date: Thu, 5 Nov 2026 13:27:45 +0100
+Subject: [PATCH] ALSA: ua101: restore the control port of the UA-1000
+
+The UA-1000's USB-MIDI interface has two cables: cable 0 is the MIDI
+IN/OUT jacks, and cable 1 carries the device's control messages (Roland
+exclusive messages for its mixer, patch bay and front-panel switches).
+The usbmidi port table already names both ("%s MIDI" and "%s Control"),
+and the snd-usb-audio quirk that drove the device before this driver
+declared both (out_cables and in_cables 0x0003).
+
+When the UA-1000 moved to this driver it took the UA-101's endpoint
+description, which has cable 0 only, so its control port disappeared:
+nothing can be sent to the mixer, and the device's own messages on
+cable 1 are dropped.
+
+Declare both cables for the UA-1000 again.  Its MIDI jacks stay the first
+substream, so hw:X,0,0 is unchanged, and the control port becomes the
+second one.  The UA-101 is not changed.
+
+Fixes: e584bc3cf686 ("ALSA: ua101: add Edirol UA-1000 support")
+Cc: stable@vger.kernel.org
+---
+ sound/usb/misc/ua101.c | 26 +++++++++++++++++++-------
+ 1 file changed, 19 insertions(+), 7 deletions(-)
+
+diff --git a/sound/usb/misc/ua101.c b/sound/usb/misc/ua101.c
+index bd8e0ed..e9bc886 100644
+--- a/sound/usb/misc/ua101.c
++++ b/sound/usb/misc/ua101.c
+@@ -1184,13 +1184,25 @@ static void ua101_card_free(struct snd_card *card)
+ static int ua101_probe(struct usb_interface *interface,
+ 		       const struct usb_device_id *usb_id)
+ {
+-	static const struct snd_usb_midi_endpoint_info midi_ep = {
+-		.out_cables = 0x0001,
+-		.in_cables = 0x0001
++	static const struct snd_usb_midi_endpoint_info midi_ep[2] = {
++		{	/* UA-101 */
++			.out_cables = 0x0001,
++			.in_cables = 0x0001
++		},
++		{	/* UA-1000: MIDI jacks (cable 0), control (cable 1) */
++			.out_cables = 0x0003,
++			.in_cables = 0x0003
++		},
+ 	};
+-	static const struct snd_usb_audio_quirk midi_quirk = {
+-		.type = QUIRK_MIDI_FIXED_ENDPOINT,
+-		.data = &midi_ep
++	static const struct snd_usb_audio_quirk midi_quirk[2] = {
++		{
++			.type = QUIRK_MIDI_FIXED_ENDPOINT,
++			.data = &midi_ep[0]
++		},
++		{
++			.type = QUIRK_MIDI_FIXED_ENDPOINT,
++			.data = &midi_ep[1]
++		},
+ 	};
+ 	static const int intf_numbers[2][3] = {
+ 		{	/* UA-101 */
+@@ -1301,7 +1313,7 @@ static int ua101_probe(struct usb_interface *interface,
+ 				       NULL, 0, 0);
+ 
+ 	err = snd_usbmidi_create(card, ua->intf[INTF_MIDI],
+-				 &ua->midi_list, &midi_quirk);
++				 &ua->midi_list, &midi_quirk[is_ua1000]);
+ 	if (err < 0)
+ 		goto probe_error;
+ 
