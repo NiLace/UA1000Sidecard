@@ -1,14 +1,31 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * toolbar.c - the panel switches, the connection status and the Device menu
+ *
+ * The plain GTK layout's bar: the sample rate (read only), CLOCK, the
+ * digital output, MONO, SOFT CTRL, OUTPUT VOLUME, PATCH BAY, the Device
+ * menu and the connection status.  Its widgets live in struct app (rate_label
+ * set means the bar exists); with the desk layout they stay NULL and the
+ * desk draws the same controls itself.
+ *
+ * Shared by both layouts: toolbar_edit_panel() and toolbar_set_clock()
+ * (what a switch change does: the ADAT rule, the notices, sending), the
+ * Device menu model and the application actions it names, and the
+ * connection status, which also enables or disables the actions that need
+ * the device.  The actions only open windows or dialogs (patchbay.c,
+ * notes.c, dialogs.c) or call app.c.
+ *
+ * Used by app.c (building, refreshing, status) and desk.c.
  */
 #include "app.h"
 
 #include <errno.h>
 
+/* The clock dropdown's entries, in the order of enum ua1000_clock. */
 static const char *const clock_labels[] = { "Internal", "External S/PDIF",
 					    "External ADAT", NULL };
 
+/* Apply a whole panel, telling the user when ADAT is refused at this rate. */
 void toolbar_edit_panel(struct app *app, const struct ua1000_panel *panel)
 {
 	struct ua1000_edit edit;
@@ -31,6 +48,9 @@ void toolbar_edit_panel(struct app *app, const struct ua1000_panel *panel)
  * its widgets to the panel's fields; what an edit does (the ADAT rule, the
  * notices, sending) is here once, in toolbar_edit_panel and
  * toolbar_set_clock.
+ *
+ * This is the "toggled" handler of the four toggle buttons; the button
+ * itself tells which field it sets.
  */
 static void on_switch(GtkToggleButton *button, gpointer data)
 {
@@ -50,6 +70,10 @@ static void on_switch(GtkToggleButton *button, gpointer data)
 	toolbar_edit_panel(app, &panel);
 }
 
+/*
+ * Select a clock source, with ADAT output for the ADAT clock, and warn on
+ * changing to an external clock.
+ */
 void toolbar_set_clock(struct app *app, enum ua1000_clock clock)
 {
 	struct ua1000_panel panel = app->state.panel;
@@ -63,9 +87,10 @@ void toolbar_set_clock(struct app *app, enum ua1000_clock clock)
 		panel.digital_out_adat = true;
 	toolbar_edit_panel(app, &panel);
 	/* The device cannot say whether it has locked (README, Known
-	 * limitations): say what an external clock means (with nothing
-	 * connected, the GUI once froze after S/PDIF and ADAT). */
-	/* (if the send just lost the device, its own notice stays) */
+	 * limitations): say what an external clock means, since with nothing
+	 * on that input the device may stop answering.  Only when the clock
+	 * did change, and not when the send just lost the device: its own
+	 * notice stays. */
 	if (external && app->state.panel.clock == clock &&
 	    !(was_connected && !app_connected(app)))
 		app_notice(app,
@@ -84,6 +109,10 @@ void toolbar_set_clock(struct app *app, enum ua1000_clock clock)
 				     "connected.");
 }
 
+/*
+ * "notify::selected" of the clock dropdown; its positions are the enum's
+ * values (clock_labels).
+ */
 static void on_clock(GtkDropDown *dropdown, GParamSpec *pspec, gpointer data)
 {
 	(void)pspec;
@@ -91,6 +120,7 @@ static void on_clock(GtkDropDown *dropdown, GParamSpec *pspec, gpointer data)
 		data, (enum ua1000_clock)gtk_drop_down_get_selected(dropdown));
 }
 
+/* A panel switch as a toggle button, wired to on_switch(). */
 static GtkWidget *switch_new(struct app *app, const char *label,
 			     const char *tooltip)
 {
@@ -101,6 +131,10 @@ static GtkWidget *switch_new(struct app *app, const char *label,
 	return button;
 }
 
+/*
+ * A caption beside a control, in a box; a screen reader names the control
+ * by the caption.
+ */
 static GtkWidget *captioned(const char *caption, GtkWidget *control)
 {
 	GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
@@ -114,6 +148,7 @@ static GtkWidget *captioned(const char *caption, GtkWidget *control)
 	return box;
 }
 
+/* Build the Device menu; the caller owns the returned reference. */
 GMenuModel *toolbar_device_menu(void)
 {
 	GMenu *menu = g_menu_new();
@@ -160,6 +195,7 @@ static void switches_new(struct app *app)
 				     "when on, on MAIN only when off");
 }
 
+/* Build the plain layout's bar and show the current status on it. */
 GtkWidget *toolbar_new(struct app *app)
 {
 	GtkWidget *bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
@@ -198,6 +234,10 @@ GtkWidget *toolbar_new(struct app *app)
 	return bar;
 }
 
+/*
+ * Make the bar's widgets show the panel.  Called by app_refresh() with
+ * app->refreshing set, so the handlers this fires send nothing.
+ */
 void toolbar_refresh(struct app *app)
 {
 	const struct ua1000_panel *p = &app->state.panel;
@@ -223,7 +263,7 @@ void toolbar_refresh(struct app *app)
 /*
  * What only the device can do (memories, USER SET, sending everything) is
  * offered only while it is connected; other edits are kept in the state and
- * reach the device when it connects.
+ * reach the device when it connects.  Called by toolbar_set_status().
  */
 static void enable_device_actions(struct app *app, bool on)
 {
@@ -240,11 +280,16 @@ static void enable_device_actions(struct app *app, bool on)
 	}
 }
 
+/* The connection status in words. */
 const char *toolbar_status_text(const struct app *app)
 {
 	return app_connected(app) ? "Connected" : "Not connected";
 }
 
+/*
+ * Show the connection status (the label's text and its CSS class, or the
+ * desk's legend) and enable the actions that need the device.
+ */
 void toolbar_set_status(struct app *app)
 {
 	bool on = app_connected(app);
@@ -263,8 +308,14 @@ void toolbar_set_status(struct app *app)
 				 on ? "connected" : "disconnected");
 }
 
-/* ---- Actions ---- */
+/*
+ * ---- Actions ----
+ *
+ * The app.* actions of the Device menu, one handler each; data is the
+ * struct app.  Installed by toolbar_install_actions().
+ */
 
+/* app.patchbay: the PATCH BAY window. */
 static void act_patchbay(GSimpleAction *a, GVariant *p, gpointer data)
 {
 	(void)a;
@@ -272,6 +323,7 @@ static void act_patchbay(GSimpleAction *a, GVariant *p, gpointer data)
 	patchbay_present(data);
 }
 
+/* app.notes: the NOTES window. */
 static void act_notes(GSimpleAction *a, GVariant *p, gpointer data)
 {
 	(void)a;
@@ -279,6 +331,7 @@ static void act_notes(GSimpleAction *a, GVariant *p, gpointer data)
 	notes_present(data);
 }
 
+/* app.sync: send every setting to the device. */
 static void act_sync(GSimpleAction *a, GVariant *p, gpointer data)
 {
 	(void)a;
@@ -286,6 +339,7 @@ static void act_sync(GSimpleAction *a, GVariant *p, gpointer data)
 	app_sync(data);
 }
 
+/* app.connect: connect to the device again. */
 static void act_connect(GSimpleAction *a, GVariant *p, gpointer data)
 {
 	(void)a;
@@ -293,6 +347,7 @@ static void act_connect(GSimpleAction *a, GVariant *p, gpointer data)
 	app_connect(data);
 }
 
+/* app.store-memory: the Store Memory dialog. */
 static void act_store_memory(GSimpleAction *a, GVariant *p, gpointer data)
 {
 	(void)a;
@@ -300,6 +355,7 @@ static void act_store_memory(GSimpleAction *a, GVariant *p, gpointer data)
 	dialog_memory(data, UA1000_MEMORY_STORE);
 }
 
+/* app.load-memory: the Load Memory dialog. */
 static void act_load_memory(GSimpleAction *a, GVariant *p, gpointer data)
 {
 	(void)a;
@@ -307,6 +363,7 @@ static void act_load_memory(GSimpleAction *a, GVariant *p, gpointer data)
 	dialog_memory(data, UA1000_MEMORY_LOAD);
 }
 
+/* app.user-set: the Store USER SET dialog. */
 static void act_user_set(GSimpleAction *a, GVariant *p, gpointer data)
 {
 	(void)a;
@@ -314,6 +371,7 @@ static void act_user_set(GSimpleAction *a, GVariant *p, gpointer data)
 	dialog_user_set(data);
 }
 
+/* app.reset: the Reset to Defaults dialog. */
 static void act_reset(GSimpleAction *a, GVariant *p, gpointer data)
 {
 	(void)a;
@@ -321,6 +379,7 @@ static void act_reset(GSimpleAction *a, GVariant *p, gpointer data)
 	dialog_reset(data);
 }
 
+/* Close the main window (and with it the application); also Ctrl+Q. */
 static void act_quit(GSimpleAction *a, GVariant *p, gpointer data)
 {
 	struct app *app = data;
@@ -330,6 +389,7 @@ static void act_quit(GSimpleAction *a, GVariant *p, gpointer data)
 	gtk_window_close(app->window);
 }
 
+/* Register the Device menu's actions on the application, and Ctrl+Q. */
 void toolbar_install_actions(struct app *app)
 {
 	static const GActionEntry actions[] = {

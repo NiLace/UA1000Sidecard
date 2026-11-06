@@ -2,6 +2,26 @@
 /*
  * ua1000_proto.c - the UA-1000 control protocol, without any I/O
  *
+ * This module owns the byte level of the protocol.  It turns mixer, patch-bay
+ * and panel settings into complete Roland exclusive messages (DT1 data sets
+ * and RQ1 data requests), checks and decodes the DT1 messages the device
+ * sends back, and reassembles SysEx messages from a raw MIDI byte stream.  It
+ * also holds the value laws every front end shares: dB and fader position to
+ * the 23-bit linear gain, pan position to its raw value, rate code to Hz.
+ *
+ * Invariants: every message built here is a whole, checksummed SysEx that
+ * fits in struct ua1000_msg, and a builder that rejects its arguments leaves
+ * msg->len at 0, so a refused message is never sent half-built.  Values wider
+ * than seven bits travel one nibble per byte, most significant first.
+ *
+ * It does not open, read or write a device (ua1000_midi.c does), keep the
+ * device's state, nor decode the mixer part of the 256-byte block
+ * (ua1000_state.c does both): the decoder here reads only the panel switches
+ * and the patch-bay tables that notifications and global dumps carry.
+ *
+ * Used by ua1000_midi.c (stream reassembly and DT1 parsing), ua1000_state.c,
+ * ua1000ctl.c and the GUI under src/gui/.
+ *
  * See ua1000_proto.h for the interface and docs/PROTOCOL.md for where each
  * address and value comes from.
  */
@@ -11,6 +31,11 @@
 #include <math.h>
 #include <string.h>
 
+/*
+ * Framing of a Roland exclusive message: F0, manufacturer (Roland), device ID
+ * (17, the factory default), the UA-1000's two-byte model ID, then the
+ * command: DT1 (data set) or RQ1 (data request).
+ */
 #define SYSEX_START 0xF0
 #define SYSEX_END 0xF7
 #define ROLAND_ID 0x41
@@ -20,10 +45,14 @@
 #define CMD_DT1 0x12
 #define CMD_RQ1 0x11
 
-/* Header bytes before the address: F0 41 10 00 69 12 */
+/* Header bytes before the address, F0 41 10 00 69 cmd: DT1 and RQ1 alike. */
 #define DT1_HEADER 6
 
-/* Address byte 0x00 xx: the mixer and the patch bay. */
+/*
+ * Address 00 ss xx pp: the parameters.  ss names the section; xx is a
+ * channel, a routing table, a memory slot or a MONITOR OUT side; pp is the
+ * parameter, or the pair in the patch bay.
+ */
 #define AREA_MIXER 0x00
 #define SECTION_SYSTEM 0x00
 #define SECTION_NOTIFY 0x01
@@ -59,7 +88,11 @@
 #define NOTIFY_MONO 0x04
 #define NOTIFY_SOFT_CTRL 0x05
 
-/* Byte offsets inside the global block. */
+/*
+ * Byte offsets inside the global block (02 00 00 00).  GLOBAL_DECODED_LEN is
+ * how much of a dump ua1000_decode() reads: the panel bytes and the WAVE IN
+ * and DM ON tables.
+ */
 #define GLOBAL_RATE 4
 #define GLOBAL_CLOCK 5
 #define GLOBAL_SWITCHES 6
@@ -79,6 +112,10 @@
 
 /* ---- Value conversions ---- */
 
+/*
+ * dB to gain.  NaN and -INFINITY give silence; anything above +12.04 dB
+ * saturates at UA1000_GAIN_MAX.
+ */
 uint32_t ua1000_gain_from_db(double db)
 {
 	if (isnan(db) || db == -INFINITY)
@@ -91,6 +128,7 @@ uint32_t ua1000_gain_from_db(double db)
 	return (uint32_t)gain;
 }
 
+/* Gain to dB relative to unity; silence is -INFINITY. */
 double ua1000_gain_to_db(uint32_t gain)
 {
 	if (gain == 0)
@@ -111,6 +149,10 @@ double ua1000_gain_to_db(uint32_t gain)
 #define FADER_RATIO 1.0053813222455683705
 #define FADER_OFFSET 34946.583459509740866
 
+/*
+ * Fader position to gain by the law above; positions at or past
+ * UA1000_FADER_MAX give the maximum.
+ */
 uint32_t ua1000_fader_to_gain(unsigned int position)
 {
 	if (position == 0)
@@ -123,6 +165,10 @@ uint32_t ua1000_fader_to_gain(unsigned int position)
 	return gain > UA1000_GAIN_MAX ? UA1000_GAIN_MAX : (uint32_t)gain;
 }
 
+/*
+ * The inverse of the fader law, rounded to the nearest position and clamped
+ * to UA1000_FADER_MAX.
+ */
 unsigned int ua1000_gain_to_fader(uint32_t gain)
 {
 	if (gain == 0)
@@ -136,6 +182,7 @@ unsigned int ua1000_gain_to_fader(uint32_t gain)
 	return (unsigned int)position;
 }
 
+/* Pan position to raw value; positions beyond +-20 are clamped. */
 uint16_t ua1000_pan_from_position(int position)
 {
 	if (position < -UA1000_PAN_STEPS)
@@ -151,6 +198,10 @@ uint16_t ua1000_pan_from_position(int position)
 	return (uint16_t)((steps * UA1000_PAN_RAW_MAX + span / 2) / span);
 }
 
+/*
+ * Raw pan value to the nearest position; values past 0x8000 count as hard
+ * right.
+ */
 int ua1000_pan_to_position(uint16_t raw)
 {
 	unsigned int span = 2 * UA1000_PAN_STEPS;
@@ -162,11 +213,16 @@ int ua1000_pan_to_position(uint16_t raw)
 	       UA1000_PAN_STEPS;
 }
 
+/* ADAT works at 44.1 and 48 kHz only (see the header). */
 bool ua1000_rate_allows_adat(enum ua1000_rate rate)
 {
 	return rate == UA1000_RATE_44100 || rate == UA1000_RATE_48000;
 }
 
+/*
+ * Rate code to Hz, or 0 when the value is no rate code: callers use the 0 to
+ * reject a code read from the device or found in a struct ua1000_panel.
+ */
 unsigned int ua1000_rate_hz(enum ua1000_rate rate)
 {
 	switch (rate) {
@@ -182,6 +238,10 @@ unsigned int ua1000_rate_hz(enum ua1000_rate rate)
 	return 0;
 }
 
+/*
+ * Hz to rate code.  False, with *rate untouched, for a rate the device does
+ * not run at.
+ */
 bool ua1000_rate_from_hz(unsigned int hz, enum ua1000_rate *rate)
 {
 	static const enum ua1000_rate all[] = {
@@ -202,6 +262,7 @@ bool ua1000_rate_from_hz(unsigned int hz, enum ua1000_rate *rate)
 
 /* ---- Default state ---- */
 
+/* The default panel switches; see the header. */
 void ua1000_panel_init(struct ua1000_panel *panel)
 {
 	*panel = (struct ua1000_panel){
@@ -213,12 +274,20 @@ void ua1000_panel_init(struct ua1000_panel *panel)
 	};
 }
 
+/*
+ * The default patch bay, what the two INITIAL presets leave: the inputs
+ * recorded, the playback on the outputs, every DM OFF pair same as DM ON.
+ */
 void ua1000_patchbay_init(struct ua1000_patchbay *patchbay)
 {
 	ua1000_apply_wave_in_preset(patchbay, UA1000_WAVE_IN_INITIAL);
 	ua1000_apply_output_preset(patchbay, UA1000_OUTPUT_INITIAL);
 }
 
+/*
+ * Whether source is a code that table takes: 00 (same as DM ON) belongs to
+ * the DM OFF table alone, and every table takes 01..0B.
+ */
 bool ua1000_source_valid(enum ua1000_route_table table, unsigned int source)
 {
 	if (source == UA1000_SRC_SAME_AS_DM_ON)
@@ -226,6 +295,10 @@ bool ua1000_source_valid(enum ua1000_route_table table, unsigned int source)
 	return source <= UA1000_SRC_WAVE_OUT_9_10;
 }
 
+/*
+ * INITIAL and LOOP BACK route WAVE IN pair p from INPUT or WAVE OUT pair p.
+ * KEEP, or a value that is no preset, leaves the table alone.
+ */
 void ua1000_apply_wave_in_preset(struct ua1000_patchbay *patchbay,
 				 enum ua1000_wave_in_preset preset)
 {
@@ -247,6 +320,11 @@ void ua1000_apply_wave_in_preset(struct ua1000_patchbay *patchbay,
 		wave_in[pair] = (uint8_t)(first + pair);
 }
 
+/*
+ * An OUTPUT preset rewrites the DM ON table and sets every DM OFF pair back
+ * to same as DM ON.  That reset is inferred: the device's dump does not carry
+ * the DM OFF table (docs/PROTOCOL.md).
+ */
 void ua1000_apply_output_preset(struct ua1000_patchbay *patchbay,
 				enum ua1000_output_preset preset)
 {
@@ -279,6 +357,7 @@ void ua1000_apply_output_preset(struct ua1000_patchbay *patchbay,
 
 /* ---- Message building ---- */
 
+/* The value that brings the sum of the bytes to 0 modulo 128. */
 uint8_t ua1000_checksum(const uint8_t *bytes, size_t len)
 {
 	unsigned int sum = 0;
@@ -288,6 +367,13 @@ uint8_t ua1000_checksum(const uint8_t *bytes, size_t len)
 	return (uint8_t)((128 - sum % 128) % 128);
 }
 
+/*
+ * Lay out one Roland exclusive message: header, cmd, the address a0..a3, len
+ * data bytes and the checksum over address and data.  Nothing checks len
+ * here: every caller passes a fixed-size buffer of at most
+ * UA1000_GLOBAL_BLOCK_SIZE bytes, which keeps the message within
+ * UA1000_SYSEX_MAX.  Always returns 0, so a builder can return its result.
+ */
 static int build_message(struct ua1000_msg *msg, uint8_t cmd, uint8_t a0,
 			 uint8_t a1, uint8_t a2, uint8_t a3,
 			 const uint8_t *data, size_t len)
@@ -313,12 +399,14 @@ static int build_message(struct ua1000_msg *msg, uint8_t cmd, uint8_t a0,
 	return 0;
 }
 
+/* A DT1 (data set): what every builder but the block request sends. */
 static int build_dt1(struct ua1000_msg *msg, uint8_t a0, uint8_t a1, uint8_t a2,
 		     uint8_t a3, const uint8_t *data, size_t len)
 {
 	return build_message(msg, CMD_DT1, a0, a1, a2, a3, data, len);
 }
 
+/* An RQ1 for the 256 bytes of block 02 bb 00 00, bb = block. */
 int ua1000_build_block_request(struct ua1000_msg *msg, unsigned int block)
 {
 	/* the size, 256, in 7-bit bytes */
@@ -332,33 +420,44 @@ int ua1000_build_block_request(struct ua1000_msg *msg, unsigned int block)
 			     0x00, size, sizeof(size));
 }
 
+/* Refuse a builder's arguments: empty the message, return -EINVAL. */
 static int invalid(struct ua1000_msg *msg)
 {
 	msg->len = 0;
 	return -EINVAL;
 }
 
+/* A mixer's address section; the caller has checked the mixer. */
 static uint8_t mixer_section(enum ua1000_mixer mixer)
 {
 	return mixer == UA1000_MIXER_INPUT ? SECTION_INPUT_MIXER
 					   : SECTION_OUTPUT_MIXER;
 }
 
+/* True for the two mixers, false for any other value in the enum. */
 bool ua1000_mixer_valid(enum ua1000_mixer mixer)
 {
 	return mixer == UA1000_MIXER_INPUT || mixer == UA1000_MIXER_OUTPUT;
 }
 
-/* Values wider than seven bits travel as one nibble per byte, MSB first. */
+/*
+ * Values wider than seven bits travel as one nibble per byte, MSB first:
+ * write the low count nibbles of value to out[0..count-1].
+ */
 static void nibbles(uint8_t *out, uint32_t value, unsigned int count)
 {
 	for (unsigned int i = 0; i < count; i++)
 		out[i] = (uint8_t)((value >> (4 * (count - 1 - i))) & 0x0F);
 }
 
+/* Data length of a gain (23 bits) and of a pan value (16 bits). */
 #define GAIN_NIBBLES 6
 #define PAN_NIBBLES 4
 
+/*
+ * A one-byte channel parameter of a mixer: mute, link or solo.  Link and
+ * solo pass the pair's first channel, where the device keeps them.
+ */
 static int build_channel_flag(struct ua1000_msg *msg, enum ua1000_mixer mixer,
 			      unsigned int channel, uint8_t param,
 			      uint8_t value)
@@ -369,6 +468,7 @@ static int build_channel_flag(struct ua1000_msg *msg, enum ua1000_mixer mixer,
 			 (uint8_t)channel, param, &value, 1);
 }
 
+/* Channel gain: six nibbles at 00 m cc 07. */
 int ua1000_build_gain(struct ua1000_msg *msg, enum ua1000_mixer mixer,
 		      unsigned int channel, uint32_t gain)
 {
@@ -382,6 +482,7 @@ int ua1000_build_gain(struct ua1000_msg *msg, enum ua1000_mixer mixer,
 			 (uint8_t)channel, PARAM_GAIN, data, sizeof(data));
 }
 
+/* Channel pan: four nibbles at 00 m cc 03. */
 int ua1000_build_pan(struct ua1000_msg *msg, enum ua1000_mixer mixer,
 		     unsigned int channel, uint16_t pan)
 {
@@ -395,12 +496,14 @@ int ua1000_build_pan(struct ua1000_msg *msg, enum ua1000_mixer mixer,
 			 (uint8_t)channel, PARAM_PAN, data, sizeof(data));
 }
 
+/* Channel on/off at 00 m cc 02: 01 is off (muted), 00 on. */
 int ua1000_build_mute(struct ua1000_msg *msg, enum ua1000_mixer mixer,
 		      unsigned int channel, bool mute)
 {
 	return build_channel_flag(msg, mixer, channel, PARAM_MUTE, mute);
 }
 
+/* Pair link, at the pair's first channel. */
 int ua1000_build_link(struct ua1000_msg *msg, enum ua1000_mixer mixer,
 		      unsigned int pair, bool link)
 {
@@ -409,6 +512,10 @@ int ua1000_build_link(struct ua1000_msg *msg, enum ua1000_mixer mixer,
 	return build_channel_flag(msg, mixer, 2 * pair, PARAM_LINK, link);
 }
 
+/*
+ * Pair solo, at the pair's first channel.  The value says which channel is
+ * soloed, and 3 silences everything (docs/PROTOCOL.md, Solo).
+ */
 int ua1000_build_solo(struct ua1000_msg *msg, enum ua1000_mixer mixer,
 		      unsigned int pair, unsigned int solo_mask)
 {
@@ -418,6 +525,7 @@ int ua1000_build_solo(struct ua1000_msg *msg, enum ua1000_mixer mixer,
 				  (uint8_t)solo_mask);
 }
 
+/* MONITOR OUT gain of one side, at 00 03 0s 07. */
 int ua1000_build_monitor_gain(struct ua1000_msg *msg, enum ua1000_side side,
 			      uint32_t gain)
 {
@@ -431,6 +539,7 @@ int ua1000_build_monitor_gain(struct ua1000_msg *msg, enum ua1000_side side,
 			 PARAM_GAIN, data, sizeof(data));
 }
 
+/* MONITOR OUT link, at 00 03 00 01: the left side's address. */
 int ua1000_build_monitor_link(struct ua1000_msg *msg, bool link)
 {
 	uint8_t value = link;
@@ -439,6 +548,7 @@ int ua1000_build_monitor_link(struct ua1000_msg *msg, bool link)
 			 PARAM_LINK, &value, 1);
 }
 
+/* The drag bracket at 00 00 00 00: 00 opens it, 01 closes it. */
 int ua1000_build_edit_gesture(struct ua1000_msg *msg, bool begin)
 {
 	uint8_t value = begin ? 0x00 : 0x01;
@@ -447,6 +557,10 @@ int ua1000_build_edit_gesture(struct ua1000_msg *msg, bool begin)
 			 SYSTEM_EDIT_GESTURE, &value, 1);
 }
 
+/*
+ * A rate and a clock source the device knows: the panel and USER SET
+ * builders refuse anything else.
+ */
 static bool panel_valid(const struct ua1000_panel *panel)
 {
 	return ua1000_rate_hz(panel->rate) != 0 &&
@@ -455,6 +569,10 @@ static bool panel_valid(const struct ua1000_panel *panel)
 		panel->clock == UA1000_CLOCK_EXT_ADAT);
 }
 
+/*
+ * The clock byte: source in bits 0-1, ADAT output in bit 2.  Bit 3
+ * (CLOCK_FLAG) is set by the device only, never written.
+ */
 static uint8_t clock_byte(const struct ua1000_panel *panel)
 {
 	return (uint8_t)(panel->clock |
@@ -462,6 +580,7 @@ static uint8_t clock_byte(const struct ua1000_panel *panel)
 						  : 0));
 }
 
+/* The switches byte: OUTPUT ALL, MONO and SOFT CTRL in bits 0-2. */
 static uint8_t switches_byte(const struct ua1000_panel *panel)
 {
 	return (uint8_t)((panel->output_all ? SWITCH_OUTPUT_ALL : 0) |
@@ -488,6 +607,10 @@ int ua1000_build_panel(struct ua1000_msg *msg, const struct ua1000_panel *panel)
 			 sizeof(data));
 }
 
+/*
+ * The USER SET, laid out as the vendor's panel writes it: 01 02 02 02, then
+ * the rate, clock and switches bytes, and zeros.
+ */
 int ua1000_build_user_set(struct ua1000_msg *msg,
 			  const struct ua1000_panel *panel)
 {
@@ -506,6 +629,7 @@ int ua1000_build_user_set(struct ua1000_msg *msg,
 			 sizeof(data));
 }
 
+/* One patch-bay entry, at 00 02 tt pp: table tt, pair pp. */
 int ua1000_build_route(struct ua1000_msg *msg, enum ua1000_route_table table,
 		       unsigned int pair, enum ua1000_source source)
 {
@@ -518,6 +642,10 @@ int ua1000_build_route(struct ua1000_msg *msg, enum ua1000_route_table table,
 			 (uint8_t)pair, &value, 1);
 }
 
+/*
+ * Run patch-bay presets on the device, data 00 w o 00 at 00 00 00 08; KEEP
+ * (00) leaves that table unchanged.
+ */
 int ua1000_build_preset(struct ua1000_msg *msg,
 			enum ua1000_wave_in_preset wave_in,
 			enum ua1000_output_preset output)
@@ -537,6 +665,11 @@ int ua1000_build_preset(struct ua1000_msg *msg,
 			 data, sizeof(data));
 }
 
+/*
+ * Store or load a memory slot at 00 00 (slot + 2) op.  Data byte i includes
+ * section bit i (enum ua1000_section order) with 02 for a store or 01 for a
+ * load, and skips it with 00.
+ */
 int ua1000_build_memory(struct ua1000_msg *msg, enum ua1000_memory_op op,
 			unsigned int slot, unsigned int sections)
 {
@@ -558,6 +691,7 @@ int ua1000_build_memory(struct ua1000_msg *msg, enum ua1000_memory_op op,
 
 /* ---- Parsing ---- */
 
+/* Check a DT1 from the device and point *dt1 into buf; see the header. */
 int ua1000_parse_dt1(const uint8_t *buf, size_t len, struct ua1000_dt1 *dt1)
 {
 	static const uint8_t header[DT1_HEADER] = {
@@ -571,6 +705,7 @@ int ua1000_parse_dt1(const uint8_t *buf, size_t len, struct ua1000_dt1 *dt1)
 	if (memcmp(buf, header, sizeof(header)) != 0 ||
 	    buf[len - 1] != SYSEX_END)
 		return -EBADMSG;
+	/* Between F0 and F7 every byte is a 7-bit data byte. */
 	for (size_t i = 1; i < len - 1; i++)
 		if (buf[i] & 0x80)
 			return -EBADMSG;
@@ -585,6 +720,11 @@ int ua1000_parse_dt1(const uint8_t *buf, size_t len, struct ua1000_dt1 *dt1)
 	return 0;
 }
 
+/*
+ * Decode a clock byte into panel: the source, the digital output and the
+ * flag the device sets with an external clock.  Notifications and global
+ * dumps carry the same byte.
+ */
 static void decode_clock(uint8_t value, struct ua1000_panel *panel)
 {
 	unsigned int source = value & CLOCK_SOURCE_MASK;
@@ -596,6 +736,7 @@ static void decode_clock(uint8_t value, struct ua1000_panel *panel)
 	panel->clock_flag = value & CLOCK_FLAG;
 }
 
+/* Decode the switches byte of a global dump into panel. */
 static void decode_switches(uint8_t value, struct ua1000_panel *panel)
 {
 	panel->output_all = value & SWITCH_OUTPUT_ALL;
@@ -603,6 +744,11 @@ static void decode_switches(uint8_t value, struct ua1000_panel *panel)
 	panel->soft_ctrl = value & SWITCH_SOFT_CTRL;
 }
 
+/*
+ * A panel-switch notification, 00 01 00 nn with one data byte: change the
+ * switch that nn names, and nothing else.  False, panel untouched, for an nn
+ * not known.
+ */
 static bool decode_notification(const struct ua1000_dt1 *dt1,
 				struct ua1000_panel *panel)
 {
@@ -626,6 +772,12 @@ static bool decode_notification(const struct ua1000_dt1 *dt1,
 	}
 }
 
+/*
+ * A global dump: the panel switches and the WAVE IN and DM ON tables.  A byte
+ * that is not a valid code leaves the current value.  In a block read with
+ * RQ1, byte 4 is the SAMPLE RATE switch's position, a rate code only on the
+ * USER SET position (docs/PROTOCOL.md): the other positions are ignored.
+ */
 static void decode_global(const struct ua1000_dt1 *dt1,
 			  struct ua1000_event *event)
 {
@@ -649,6 +801,7 @@ static void decode_global(const struct ua1000_dt1 *dt1,
 	}
 }
 
+/* Classify a DT1 from the device and decode it; see the header. */
 void ua1000_decode(const struct ua1000_dt1 *dt1, struct ua1000_event *event)
 {
 	const uint8_t *a = dt1->addr;
@@ -669,6 +822,7 @@ void ua1000_decode(const struct ua1000_dt1 *dt1, struct ua1000_event *event)
 
 /* ---- Stream reassembly ---- */
 
+/* No message in progress. */
 void ua1000_reader_init(struct ua1000_reader *reader)
 {
 	reader->len = 0;
@@ -676,6 +830,11 @@ void ua1000_reader_init(struct ua1000_reader *reader)
 	reader->overflow = false;
 }
 
+/*
+ * Feed one byte; see the header.  A message runs from F0 to F7: an F0 in the
+ * middle starts it again, any other status byte abandons it, and one too long
+ * for the buffer is read to its F7 and then dropped.
+ */
 bool ua1000_reader_feed(struct ua1000_reader *reader, uint8_t byte)
 {
 	if (byte >= 0xF8) /* real-time messages may interleave anything */

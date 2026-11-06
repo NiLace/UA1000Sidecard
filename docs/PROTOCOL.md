@@ -181,9 +181,9 @@ so the vendor's panel always writes the whole block (**captured**: two complete 
 | 12–16 | `00` | OUTPUT DM ON table |
 | 17–255 | `00` | `00` after a memory load or a preset (**captured**); the rest of the device's state when asked with RQ1 (below) |
 
-When no USER SET applies, the editor assumes what every dump in the captures shows: 48 kHz, internal clock,
-S/PDIF output, OUTPUT VOLUME on ALL, SOFT CTRL on (**captured**, as the state of the captured device; whether
-it is the factory default is **inferred**).
+The editor's default panel is the factory one (Owner's Manual, p. 44): 48 kHz, internal clock, S/PDIF output,
+OUTPUT VOLUME on MAIN, SOFT CTRL on. Every dump in the captures showed ALL instead (**captured**: the state the
+captured device was in).
 
 Sample-rate codes: `09` = 48 kHz, `0B` = 96 kHz (**captured**); `08` = 44.1 kHz, `0A` = 88.2 kHz (**inferred**
 from the sequence).

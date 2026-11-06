@@ -1,6 +1,16 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * dialogs.c - Store/Load Memory, Store USER SET and Reset to Defaults
+ *
+ * The Device menu's modal dialogs (opened by toolbar.c's actions), built
+ * on one frame, struct dialog: a content box, Cancel and an accept button
+ * whose handler decides whether the dialog closes.  A dialog's memory is
+ * tied to its window and freed when the window is destroyed.
+ *
+ * The dialogs collect a choice and hand it to the state module and app.c
+ * (ua1000_edit_store/load(), ua1000_state_reset(), app_apply(), app_sync(),
+ * app_send()); they keep no setting of their own.  app_store_user_set() is
+ * also called by desk.c, which offers the USER SET on its own panel.
  */
 #include "app.h"
 
@@ -9,10 +19,11 @@ static const char *const section_labels[UA1000_SECTIONS] = {
 	"Panel switches", "WAVE IN", "OUTPUT", "Mixer (MONITOR)"
 };
 
+/* One open dialog; freed with its window. */
 struct dialog {
 	struct app *app;
 	GtkWidget *window;
-	GtkWidget *content;
+	GtkWidget *content; /* the dialog's own widgets go here */
 	/* Returns false to keep the dialog open. */
 	bool (*accept)(struct dialog *dialog);
 	/* What the particular dialog needs. */
@@ -22,6 +33,7 @@ struct dialog {
 	GtkWidget *rate;
 };
 
+/* Cancel's "clicked" handler: close without doing anything. */
 static void on_cancel(GtkButton *button, gpointer data)
 {
 	struct dialog *d = data;
@@ -30,6 +42,7 @@ static void on_cancel(GtkButton *button, gpointer data)
 	gtk_window_destroy(GTK_WINDOW(d->window));
 }
 
+/* The accept button's "clicked" handler: close once accept() agrees. */
 static void on_accept(GtkButton *button, gpointer data)
 {
 	struct dialog *d = data;
@@ -39,6 +52,7 @@ static void on_accept(GtkButton *button, gpointer data)
 		gtk_window_destroy(GTK_WINDOW(d->window));
 }
 
+/* Let Escape close the window, as Cancel does. */
 static void close_on_escape(GtkWidget *window)
 {
 	GtkEventController *keys = gtk_shortcut_controller_new();
@@ -50,7 +64,11 @@ static void close_on_escape(GtkWidget *window)
 	gtk_widget_add_controller(window, keys);
 }
 
-/* A modal window with a content box and Cancel / accept buttons. */
+/*
+ * A modal window over the main one, with a content box and Cancel / accept
+ * buttons; accept_label takes a mnemonic ("_Store").  The caller fills
+ * d->content and presents d->window.
+ */
 static struct dialog *dialog_new(struct app *app, const char *title,
 				 const char *accept_label,
 				 bool (*accept)(struct dialog *))
@@ -91,6 +109,7 @@ static struct dialog *dialog_new(struct app *app, const char *title,
 	return d;
 }
 
+/* A paragraph of explanation, wrapped, in the content box. */
 static void add_text(struct dialog *d, const char *text)
 {
 	GtkWidget *label = gtk_label_new(text);
@@ -117,6 +136,12 @@ static void append_labelled(GtkWidget *row, const char *caption,
 
 /* ---- Memory ---- */
 
+/*
+ * Store or load the chosen slot with the ticked sections.  With no section
+ * ticked the dialog stays open (with a bell); otherwise it closes, also
+ * when the device is not connected (a notice says so).  After a load, the
+ * device is read again so the panel shows what the slot holds.
+ */
 static bool accept_memory(struct dialog *d)
 {
 	struct app *app = d->app;
@@ -160,6 +185,7 @@ static bool accept_memory(struct dialog *d)
 	return true;
 }
 
+/* Open the Store Memory or Load Memory dialog, every section ticked. */
 void dialog_memory(struct app *app, enum ua1000_memory_op op)
 {
 	GtkStringList *slots = gtk_string_list_new(NULL);
@@ -191,12 +217,15 @@ void dialog_memory(struct app *app, enum ua1000_memory_op op)
 
 /* ---- USER SET ---- */
 
+/* The rates offered, in the order of the dialog's menu. */
 static const unsigned int rates[] = { 44100, 48000, 88200, 96000 };
 
 /*
  * Store the USER SET at hz with the panel switches as they are, then tell
  * the user how it takes effect: the device changes rate only at power-on,
  * with its sample-rate switch on USER SET (Owner's Manual, p. 13).
+ * Returns false when nothing was stored: not connected, a rate the device
+ * does not offer, or ADAT at a rate that does not allow it.
  */
 bool app_store_user_set(struct app *app, unsigned int hz)
 {
@@ -235,6 +264,11 @@ bool app_store_user_set(struct app *app, unsigned int hz)
 	return true;
 }
 
+/*
+ * Store the chosen rate.  The dialog closes on success, and also when the
+ * device is not connected (nothing to retry); it stays open after an ADAT
+ * refusal.
+ */
 static bool accept_user_set(struct dialog *d)
 {
 	guint index = gtk_drop_down_get_selected(GTK_DROP_DOWN(d->rate));
@@ -245,6 +279,10 @@ static bool accept_user_set(struct dialog *d)
 	       !app_connected(d->app);
 }
 
+/*
+ * Open the Store USER SET dialog, the running rate preselected (48 kHz when
+ * the rate is none of the four).
+ */
 void dialog_user_set(struct app *app)
 {
 	static const char *const labels[] = { "44.1 kHz", "48 kHz", "88.2 kHz",
@@ -268,6 +306,10 @@ void dialog_user_set(struct app *app)
 
 /* ---- Reset ---- */
 
+/*
+ * Reset the state to the defaults (memories and running rate kept) and
+ * send all of it to the device.
+ */
 static bool accept_reset(struct dialog *d)
 {
 	ua1000_state_reset(&d->app->state);
@@ -275,6 +317,7 @@ static bool accept_reset(struct dialog *d)
 	return true;
 }
 
+/* Open the Reset to Defaults dialog, which says what a reset sets. */
 void dialog_reset(struct app *app)
 {
 	struct dialog *d =

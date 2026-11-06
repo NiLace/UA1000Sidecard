@@ -12,21 +12,27 @@
 
 /*
  * Write the default path to path.  Returns 0, or -ENOENT when neither
- * XDG_STATE_HOME nor HOME is set, or -ENAMETOOLONG.
+ * XDG_STATE_HOME nor HOME is set to an absolute path, or -ENAMETOOLONG when
+ * the path does not fit in len bytes.
  */
 int ua1000_statefile_default_path(char *path, size_t len);
 
 /*
  * Load the state.  A missing file is not an error: *state gets the defaults
  * and *existed is set to false.  Returns 0, or a negative errno with a
- * description in err.
+ * description in err: -EISDIR for a directory, -EINVAL for a malformed
+ * file (*state then holds what was read before the bad line), -EIO for a
+ * read error, or the error fopen() met.
  */
 int ua1000_statefile_load(const char *path, struct ua1000_state *state,
 			  bool *existed, char *err, size_t err_len);
 
 /*
- * Save the state atomically (a temporary file renamed over the old one),
- * creating the directory if needed.  Returns 0 or a negative errno.
+ * Save the state atomically (a temporary file renamed over the old one,
+ * both synced to disk), creating the missing directories with mode 0700.
+ * Returns 0 or a negative errno.  A failure before the rename leaves the
+ * old file untouched and no temporary file behind; one after it (syncing
+ * the directory) leaves the new file in place.
  */
 int ua1000_statefile_save(const char *path, const struct ua1000_state *state);
 

@@ -10,10 +10,21 @@
  * are no meters and nothing else changes.  With the card held by one
  * program directly through ALSA, no other program can read it: no meters.
  *
- * Sources: the card's capture channels (WAVE IN 1-10, after the device's
- * WAVE IN patch bay) and, on PipeWire, the monitor of its playback channels
- * (WAVE OUT 1-10, what the computer sends).  The JACK process callback only
- * keeps the highest absolute sample of each port since the GUI last read it.
+ * Sources: the card's capture channels (1-10: WAVE IN, after the device's
+ * WAVE IN patch bay; 11-12: MAIN, the MONITOR OUT mix) and, on PipeWire, the
+ * monitor of its playback channels (WAVE OUT 1-10, what the computer sends).
+ * The JACK process callback only keeps the highest absolute sample of each port
+ * since the GUI last read it.
+ *
+ * Threads: process() runs on JACK's real-time thread and on_server_gone() on
+ * a JACK thread; everything else runs on the GTK main thread.  They share
+ * only the atomics peak[] and gone.  The meter ports and their sources
+ * (port[], kind[], channel[], n) are set before the client is activated and
+ * never change afterwards.
+ *
+ * Not done here: dB, ballistics, clip lights and drawing (desk.c, which
+ * polls meters_take_peak() and owns the struct meters), starting a server,
+ * or reopening after the server went away (the caller closes and reopens).
  */
 #include "meters.h"
 #include "ua1000_midi.h"
@@ -40,8 +51,9 @@ enum { JACK_NO_START_SERVER = 0x01 };
 enum { JACK_PORT_IS_INPUT = 0x1, JACK_PORT_IS_OUTPUT = 0x2 };
 #define JACK_AUDIO_TYPE "32 bit float mono audio"
 
+/* libjack's functions, resolved by load_api(). */
 struct jack_api {
-	void *lib;
+	void *lib; /* dlopen() handle */
 	jack_client_t *(*client_open)(const char *name, int options,
 				      int *status, ...);
 	int (*client_close)(jack_client_t *client);
@@ -73,10 +85,10 @@ struct jack_api {
 struct meters {
 	struct jack_api jack;
 	jack_client_t *client;
-	jack_port_t *port[METERS_MAX_SOURCES];
-	enum meter_source_kind kind[METERS_MAX_SOURCES];
+	jack_port_t *port[METERS_MAX_SOURCES]; /* this client's input ports */
+	enum meter_source_kind kind[METERS_MAX_SOURCES]; /* what each meters */
 	unsigned int channel[METERS_MAX_SOURCES]; /* 0-based on the card */
-	unsigned int n;
+	unsigned int n; /* meter ports in use */
 	bool system_ok; /* jackd: the card's ports are "system:..." */
 	/* set by the JACK thread when the server goes away */
 	atomic_bool gone;
@@ -85,11 +97,17 @@ struct meters {
 	_Atomic uint32_t peak[METERS_MAX_SOURCES];
 };
 
+/*
+ * Load libjack and resolve the functions used.  False when the library or
+ * a required function is missing; the handle may stay in j->lib for
+ * meters_close() to release.  The optional functions may be left NULL.
+ */
 static bool load_api(struct jack_api *j)
 {
 	j->lib = dlopen("libjack.so.0", RTLD_NOW | RTLD_LOCAL);
 	if (!j->lib)
 		return false;
+/* a required function: without it, no meters */
 #define SYM(field, name)                                                       \
 	do {                                                                   \
 		*(void **)&j->field = dlsym(j->lib, name);                     \
@@ -119,6 +137,7 @@ static bool load_api(struct jack_api *j)
 	return true;
 }
 
+/* A float's bits as an integer: the peaks are kept in atomic integers. */
 static uint32_t float_bits(float f)
 {
 	uint32_t u;
@@ -127,6 +146,7 @@ static uint32_t float_bits(float f)
 	return u;
 }
 
+/* The float whose bits float_bits() gave. */
 static float bits_float(uint32_t u)
 {
 	float f;
@@ -135,8 +155,12 @@ static float bits_float(uint32_t u)
 	return f;
 }
 
-/* The audio thread: no allocation, no locks; one compare-exchange per port
- * per period (the positive floats order as their bits do). */
+/*
+ * The JACK process callback, on the audio thread: raise each meter's peak to
+ * the period's highest absolute sample.  No allocation, no locks; one
+ * compare-exchange per port per period (the positive floats order as their
+ * bits do).
+ */
 static int process(jack_nframes_t frames, void *arg)
 {
 	struct meters *m = arg;
@@ -163,11 +187,6 @@ static int process(jack_nframes_t frames, void *arg)
 	return 0;
 }
 
-/*
- * A port of the UA-1000 and its 0-based channel: PipeWire names them
- * "<card>:capture_AUX<n>" and "<card>:monitor_AUX<n>" (n from 0); jackd
- * names its device's "system:capture_<n>" (n from 1).
- */
 /* "<prefix><digits>" and nothing after: the index, in *n */
 static bool port_index(const char *s, const char *prefix, unsigned int *n)
 {
@@ -185,6 +204,12 @@ static bool port_index(const char *s, const char *prefix, unsigned int *n)
 	return true;
 }
 
+/*
+ * A port of the UA-1000 and its 0-based channel: PipeWire names them
+ * "<card>:capture_AUX<n>" and "<card>:monitor_AUX<n>" (n from 0); jackd
+ * names its device's "system:capture_<n>" (n from 1), taken only when
+ * system_ok.  Whether name is one, and if so its kind and channel.
+ */
 static bool classify(const char *name, bool system_ok,
 		     enum meter_source_kind *kind, unsigned int *channel)
 {
@@ -212,6 +237,7 @@ static bool classify(const char *name, bool system_ok,
 	return false;
 }
 
+/* Whether an ALSA alias names the UA-1000's card (see meters.h). */
 bool meters_alsa_alias_is_card(const char *alias, int index, const char *id)
 {
 	static const char prefix[] = "alsa_pcm:";
@@ -239,7 +265,8 @@ bool meters_alsa_alias_is_card(const char *alias, int index, const char *id)
  * jackd's ports are all "system:capture_<n>", whatever card it runs on;
  * jackd gives each the alias "alsa_pcm:<device>:out<n>" (measured: jackd
  * -d alsa -d hw:2 named them "alsa_pcm:hw:2:out1" ...).  A port whose ALSA
- * alias names another card is not the UA-1000's.
+ * alias names another card is not the UA-1000's.  When the aliases cannot
+ * be read (no such functions in this libjack, no aliases), the port is taken.
  */
 static bool system_port_is_ua1000(struct meters *m, const char *name)
 {
@@ -265,6 +292,11 @@ static bool system_port_is_ua1000(struct meters *m, const char *name)
 	return true;
 }
 
+/*
+ * Register a meter input port, "in_<n>" or "out_<n>", for each UA-1000
+ * source among names (jack_get_ports()'s list), up to METERS_MAX_SOURCES.
+ * Before activation.
+ */
 static void add_sources(struct meters *m, const char **names, bool system_ok)
 {
 	for (size_t i = 0; names && names[i] && m->n < METERS_MAX_SOURCES;
@@ -297,7 +329,8 @@ static void add_sources(struct meters *m, const char **names, bool system_ok)
  * only_idle, only the meter ports left with no connection: the device was
  * switched off or unplugged, and the server removed its ports and made
  * them again when it came back (measured on the device: after a power
- * cycle every meter stayed unconnected, dead until a restart).
+ * cycle every meter stayed unconnected, dead until a restart).  A failed
+ * connection is not reported: that meter reads silence until the next try.
  */
 static void connect_sources(struct meters *m, bool only_idle)
 {
@@ -321,6 +354,7 @@ static void connect_sources(struct meters *m, bool only_idle)
 		m->jack.free((void *)names);
 }
 
+/* Reconnect the sources when some meter has no connection. */
 void meters_reconnect(struct meters *m)
 {
 	bool idle = false;
@@ -340,7 +374,10 @@ static void quiet(const char *msg)
 	(void)msg;
 }
 
-/* The JACK thread: the server went away (stopped, restarted). */
+/*
+ * jack_on_shutdown() callback, on a JACK thread: the server went away
+ * (stopped, restarted).  Only flags it; the GUI notices in meters_alive().
+ */
 static void on_server_gone(void *arg)
 {
 	struct meters *m = arg;
@@ -348,11 +385,13 @@ static void on_server_gone(void *arg)
 	atomic_store(&m->gone, true);
 }
 
+/* Whether the server is still there. */
 bool meters_alive(struct meters *m)
 {
 	return m && !atomic_load(&m->gone);
 }
 
+/* Open a JACK client with a meter port per UA-1000 source, connected. */
 struct meters *meters_open(void)
 {
 	struct meters *m = calloc(1, sizeof(*m));
@@ -372,6 +411,7 @@ struct meters *meters_open(void)
 	if (!m->client)
 		goto fail;
 	m->jack.on_shutdown(m->client, on_server_gone, m);
+	/* PipeWire: the ports carry the card's name */
 	names = m->jack.get_ports(m->client, "UA-1000", JACK_AUDIO_TYPE,
 				  JACK_PORT_IS_OUTPUT);
 	found = names && names[0];
@@ -399,6 +439,7 @@ fail:
 	return NULL;
 }
 
+/* Deactivate and close the client and unload libjack. */
 void meters_close(struct meters *m)
 {
 	if (!m)
@@ -412,6 +453,10 @@ void meters_close(struct meters *m)
 	free(m);
 }
 
+/*
+ * Take a channel's peak, leaving 0 for the JACK thread to raise again.  A
+ * linear search: there are at most METERS_MAX_SOURCES meters.
+ */
 float meters_take_peak(struct meters *m, enum meter_source_kind kind,
 		       unsigned int channel, bool *available)
 {

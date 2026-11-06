@@ -15,6 +15,7 @@
 
 #include <gtk/gtk.h>
 
+/* One channel's controls in a mixer, made by mixer_create(). */
 struct strip_widgets {
 	GtkWidget *mute; /* toggle: active when muted ("M") */
 	GtkWidget *solo; /* toggle */
@@ -26,7 +27,7 @@ struct desk; /* desk.c: the panel drawn from renders, when installed */
 
 struct patchbay_widgets {
 	GtkWidget *window; /* hidden, not destroyed, when closed */
-	GtkWidget *route[3][UA1000_PAIRS];
+	GtkWidget *route[3][UA1000_PAIRS]; /* per routing table and pair */
 };
 
 struct notes_widgets {
@@ -38,18 +39,19 @@ struct notes_widgets {
 
 struct app {
 	GtkApplication *gtk;
-	GtkWindow *window;
+	GtkWindow *window; /* the main window; NULL before app_build(), and
+			    * again once it is destroyed */
 
 	struct ua1000_state state;
 	bool state_known; /* false until a state file exists */
 	char state_path[4096];
 	char *saved_text; /* the state file as we last wrote it */
-	guint save_source;
-	GFileMonitor *file_monitor;
+	guint save_source; /* the pending save's timeout, or 0 */
+	GFileMonitor *file_monitor; /* the state file's; NULL if none */
 
 	const char *port_option; /* -p, or NULL to find the device */
-	struct ua1000_midi *midi;
-	guint midi_source;
+	struct ua1000_midi *midi; /* the control port; NULL: not connected */
+	guint midi_source; /* the watch on its input, or 0 */
 	/* On connecting, the device was asked for its state: the answer is
 	 * awaited until this timeout (then the saved state is sent instead). */
 	guint read_source;
@@ -58,17 +60,18 @@ struct app {
 	unsigned int reread_slot; /* that load's memory, for the notice */
 
 	/* The vendor's panel brackets each drag of a fader or pan knob. */
-	bool gesture_open;
-	guint gesture_source;
+	bool gesture_open; /* a begin was sent, its end not yet */
+	guint gesture_source; /* the timeout that ends it, or 0 */
 
 	/* Set while widgets are being made to show the state. */
 	bool refreshing;
 
 	struct strip_widgets strip[2][UA1000_CHANNELS];
 	GtkWidget *link[2][UA1000_PAIRS];
-	GtkWidget *monitor_fader[2];
+	GtkWidget *monitor_fader[2]; /* indexed by ua1000_side */
 	GtkWidget *monitor_link;
 
+	/* The plain layout's bar (toolbar.c); NULL on the desk. */
 	GtkWidget *clock;
 	GtkWidget *digital_out;
 	GtkWidget *mono;
@@ -76,8 +79,9 @@ struct app {
 	GtkWidget *output_all;
 	GtkWidget *rate_label;
 	GtkWidget *status;
+
 	GtkWidget *notice_window; /* shown while a notice is up */
-	GtkWidget *notice_label;
+	GtkWidget *notice_label; /* its text */
 	char *notice_pending; /* a notice waiting for the main window */
 
 	struct patchbay_widgets patchbay;
@@ -87,13 +91,40 @@ struct app {
 };
 
 /* app.c */
+/*
+ * Set the state file's path (state_path, or the default one when NULL) and
+ * load the state from it; a missing file leaves the editor's defaults.
+ * Returns 0, or a negative errno with a description in err.
+ */
 int app_load(struct app *app, const char *state_path, char *err,
 	     size_t err_len);
+/*
+ * Build the main window (the desk when its images load, else the plain
+ * layout), watch the state file and connect to the device.  Once, on the
+ * application's activation.
+ */
 void app_build(struct app *app);
+/*
+ * End an open gesture, write a pending save, let the device take what was
+ * sent, disconnect, and release the file monitor, the notes and the desk.
+ * On the application's shutdown.
+ */
 void app_shutdown(struct app *app);
+/*
+ * Finish an edit a control made: ret is its ua1000_edit_*() result.  When
+ * the state refused it (ret != 0), the widgets are put back; otherwise the
+ * edit's messages are sent, a save is scheduled and the widgets refreshed.
+ * continuous marks a drag (fader, pan): its edits are bracketed by one edit
+ * gesture, ended when the control has been still for a moment or by the
+ * next edit that is not continuous.
+ */
 void app_apply(struct app *app, int ret, const struct ua1000_edit *edit,
 	       bool continuous);
+/* Save the state file shortly after the last call (each call restarts the
+ * delay). */
 void app_schedule_save(struct app *app);
+/* Send messages to the device, if connected.  A send error disconnects and
+ * raises a notice. */
 void app_send(struct app *app, const struct ua1000_msg *msg, size_t count);
 /* Take the state the device reported (its answer to a block request): the
  * panel shows it, saves it, and gives the device the panel's solos. */
@@ -105,8 +136,20 @@ void app_reread_device_later(struct app *app, unsigned int slot);
 
 /* Send the whole state to the device, save it and show it. */
 void app_sync(struct app *app);
+/*
+ * (Re)open the control port (app->port_option, or the one found by name),
+ * watch its input, take the card's sample rate, and ask the device for its
+ * state; without an answer the saved state is sent.  A failure raises a
+ * notice and leaves the GUI disconnected.
+ */
 void app_connect(struct app *app);
+/*
+ * Tell the user something, in a small window over the main window.  A newer
+ * notice replaces the text of one shown.  Before the main window is mapped,
+ * the latest notice waits for it; without a main window it is dropped.
+ */
 void app_notice(struct app *app, const char *text);
+/* Whether the device's control port is open. */
 bool app_connected(const struct app *app);
 
 /* A PNG or JPEG as a cairo surface drawn at its 1x size (a 2x image gets
@@ -125,6 +168,7 @@ void mixer_create(struct app *app);
 bool app_double_press(GObject *control);
 /* mixer_create(), laid out with GTK's own widgets. */
 GtkWidget *mixer_new(struct app *app);
+/* Make the mixer's widgets show app->state (from app_refresh()). */
 void mixer_refresh(struct app *app);
 /* A pan position (-20..20) as the panel writes it: "L5", "C", "R12". */
 char *mixer_pan_text(double position);
@@ -151,7 +195,7 @@ void patchbay_refresh(struct app *app);
 /* desk.c */
 /*
  * The panel as the renders of gui/scene draw it, from the assets in dir
- * (desk.layout, plate.png, lit.png, cap_*.png, per scale).  NULL when they
+ * (desk.layout, plate.jpg, lit.jpg, cap_*.png, per scale).  NULL when they
  * are missing or do not parse: the caller falls back to the plain layout.
  */
 GtkWidget *desk_new(struct app *app, const char *dir);

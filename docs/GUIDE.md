@@ -112,9 +112,9 @@ USER SET.
 ![The rate menu](img/rate-menu.png)
 
 A click on the display opens this menu: the rate chosen is **stored in the USER SET**, the device's power-on
-settings, together with everything as it is now: panel switches, patch bay and both mixers (read back from the
-device: with the switch on USER SET, it powers up exactly as the USER SET was stored, and what changed after that is
-gone). A notice then says how to use it:
+settings. The panel sends the rate and the panel switches; read back from the device, the USER SET also holds the
+patch bay and both mixers as they were when it was stored, and with the switch on USER SET the device powers up in
+exactly that state: what changed after the store is gone at the next power-on. A notice then says how to use it:
 
 1. Close every program that is using the UA-1000.
 2. Turn the SAMPLE RATE switch on the front panel to USER SET.

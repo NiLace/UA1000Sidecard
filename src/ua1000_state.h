@@ -20,6 +20,7 @@
 
 #include <stdio.h>
 
+/* One channel strip of a MONITOR mixer, in the device's raw units. */
 struct ua1000_strip {
 	uint32_t gain;
 	uint16_t pan;
@@ -27,6 +28,7 @@ struct ua1000_strip {
 	bool solo;
 };
 
+/* One MONITOR mixer: ten strips, and a link flag per pair. */
 struct ua1000_mixer_state {
 	struct ua1000_strip strip[UA1000_CHANNELS];
 	bool link[UA1000_PAIRS];
@@ -40,6 +42,7 @@ struct ua1000_memory {
 	bool monitor_link;
 };
 
+/* Everything the editor knows of the device, as the state file holds it. */
 struct ua1000_state {
 	struct ua1000_panel panel;
 	struct ua1000_patchbay patchbay;
@@ -53,9 +56,10 @@ struct ua1000_state {
 };
 
 /*
- * The editor's defaults: unity gain, centre pan, nothing muted, soloed or
- * linked, the monitor linked at unity, and the device's initial panel and
- * patch bay.  The device's own power-up mixer settings are not known.
+ * The editor's defaults: unity gain, nothing muted or soloed; OUTPUT 1-10
+ * and INPUT 9-10 linked as stereo pairs (odd channel hard left, even hard
+ * right), INPUT 1-8 centred and unlinked; the monitor linked at unity; the
+ * factory panel switches and the device's initial patch bay.
  */
 void ua1000_state_init(struct ua1000_state *state);
 
@@ -128,8 +132,9 @@ int ua1000_edit_load(struct ua1000_state *state, struct ua1000_edit *edit,
  * The device's state from its answer to ua1000_build_block_request() for
  * UA1000_BLOCK_CURRENT (docs/PROTOCOL.md, Reading the device): panel, the
  * three patch-bay tables, links, mutes, pans and gains of both mixers and
- * MONITOR OUT.  The solos are not decoded (their encoding is unknown): they
- * are left off, as are the memories.  Returns 0, or -EBADMSG when the
+ * MONITOR OUT.  The solos are not decoded (the block holds only the last
+ * solo written to each mixer, not one per pair): they are left off, as are
+ * the memories.  Returns 0, or -EBADMSG when the
  * message is not that block or holds a value out of range.
  */
 int ua1000_state_from_block(struct ua1000_state *state,
@@ -191,12 +196,15 @@ bool ua1000_route_table_parse(const char *name, enum ua1000_route_table *table);
  * The state file: plain text, one "key value..." line per setting, headed by
  * a format version.  Unknown keys are refused rather than ignored, so a typo
  * in a hand-edited file is reported instead of silently dropped.
+ *
+ * ua1000_state_write() returns 0, or -EIO when the stream has an error.
  */
 int ua1000_state_write(const struct ua1000_state *state, FILE *f);
 
 /*
  * Read a state file into *state, which is first reset to the defaults.
- * Returns 0, or -EINVAL with a description of the first bad line in err.
+ * Returns 0, -EINVAL with a description of the first bad line in err (then
+ * *state holds what was read before it), or -EIO on a read error.
  */
 int ua1000_state_read(struct ua1000_state *state, FILE *f, char *err,
 		      size_t err_len);

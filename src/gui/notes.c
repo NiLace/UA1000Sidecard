@@ -11,6 +11,15 @@
  * (notebook.jpg and notebook.layout, from gui/scene); without them, it is a
  * plain window.  The text is an ordinary GtkTextView: selection, clipboard,
  * undo and scrolling behave as in any editor.
+ *
+ * The note lives in its own file, "notes" in the state file's directory,
+ * written whole and atomically; nothing else in the editor reads it, and
+ * it is not sent to the device.  struct notes_widgets (app->notes) holds
+ * the window, its buffer, the pending save and whether the text is
+ * unsaved; window and buffer are NULL while the window is closed (it is
+ * destroyed, not hidden).
+ *
+ * Used by toolbar.c (the app.notes action) and by app.c at shutdown.
  */
 #include "app.h"
 
@@ -20,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Quiet time after the last change before the note is written. */
 #define NOTES_SAVE_DELAY_MS 500
 
 /* $XDG_STATE_HOME/ua1000/notes, or "notes" beside a state file given by -s. */
@@ -31,6 +41,11 @@ static void notes_path(const struct app *app, char *path, size_t len)
 	g_free(dir);
 }
 
+/*
+ * Write the note if it is unsaved, cancelling a pending timed save, and
+ * create the directory if needed.  A failure is shown as a notice and the
+ * note stays unsaved, so the next change or close tries again.
+ */
 static void save_now(struct app *app)
 {
 	struct notes_widgets *n = &app->notes;
@@ -61,6 +76,7 @@ static void save_now(struct app *app)
 	g_free(text);
 }
 
+/* The timed save, NOTES_SAVE_DELAY_MS after the last change. */
 static gboolean on_save_timeout(gpointer data)
 {
 	struct app *app = data;
@@ -70,6 +86,7 @@ static gboolean on_save_timeout(gpointer data)
 	return G_SOURCE_REMOVE;
 }
 
+/* The buffer's "changed" handler: mark unsaved and restart the timer. */
 static void on_changed(GtkTextBuffer *buffer, gpointer data)
 {
 	struct app *app = data;
@@ -83,6 +100,7 @@ static void on_changed(GtkTextBuffer *buffer, gpointer data)
 		g_timeout_add(NOTES_SAVE_DELAY_MS, on_save_timeout, app);
 }
 
+/* Save before the window closes; FALSE lets it close. */
 static gboolean on_close_request(GtkWindow *window, gpointer data)
 {
 	(void)window;
@@ -90,6 +108,11 @@ static gboolean on_close_request(GtkWindow *window, gpointer data)
 	return FALSE;
 }
 
+/*
+ * The window's "destroy" handler, also reached when the main window takes
+ * it along: save, and forget the window and its buffer so that
+ * notes_present() builds a new one.
+ */
 static void on_destroy(GtkWidget *window, gpointer data)
 {
 	struct app *app = data;
@@ -100,6 +123,11 @@ static void on_destroy(GtkWidget *window, gpointer data)
 	app->notes.buffer = NULL;
 }
 
+/*
+ * Fill the buffer from the notes file.  A missing file is an empty note; a
+ * file that is not UTF-8 is not shown, and not overwritten until the user
+ * types; another error is shown as a notice.  The buffer starts saved.
+ */
 static void load(struct app *app)
 {
 	gchar *text = NULL;
@@ -126,7 +154,9 @@ static void load(struct app *app)
 
 /*
  * notebook.layout: "size W H" and "text X0 Y0 X1 Y1", the page's writing
- * area, in pixels of the 1x image.
+ * area, in pixels of the 1x image.  Other lines are skipped, as is a line
+ * whose numbers do not parse.  Returns true when both were found and the
+ * size is positive.
  */
 static bool load_layout(const char *path, double size[2], double text[4])
 {
@@ -167,6 +197,7 @@ static bool load_layout(const char *path, double size[2], double text[4])
 	return have_size && have_text && size[0] > 0 && size[1] > 0;
 }
 
+/* The page area's draw function: the page image at the origin. */
 static void paint_page(GtkDrawingArea *area, cairo_t *cr, int width, int height,
 		       gpointer data)
 {
@@ -180,7 +211,8 @@ static void paint_page(GtkDrawingArea *area, cairo_t *cr, int width, int height,
 /*
  * The page, drawn at its 1x size.  (A GtkPicture asks for its image's own
  * size, twice the page's for the 2x image: the window opened at twice the
- * page, the rest of it empty.)
+ * page, the rest of it empty.)  The area owns the surface.  NULL when the
+ * image cannot be loaded.
  */
 static GtkWidget *page_image(const char *path, double scale, double w, double h)
 {
@@ -199,7 +231,11 @@ static GtkWidget *page_image(const char *path, double scale, double w, double h)
 	return area;
 }
 
-/* The editor on the rendered page, or NULL without the images. */
+/*
+ * The editor on the rendered page, or NULL without the images: the layout
+ * from the 1x set, the page from the 2x set when present (else 1x), and
+ * the editor sized and placed on the page's writing area.
+ */
 static GtkWidget *page_new(GtkWidget *editor, const char *dir)
 {
 	char path[4096];
@@ -226,6 +262,7 @@ static GtkWidget *page_new(GtkWidget *editor, const char *dir)
 	return fixed;
 }
 
+/* Show the NOTES window, building it (and loading the note) if closed. */
 void notes_present(struct app *app)
 {
 	struct notes_widgets *n = &app->notes;
@@ -246,6 +283,7 @@ void notes_present(struct app *app)
 				       GTK_ACCESSIBLE_PROPERTY_LABEL,
 				       "Notes from device", -1);
 	n->buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(view));
+	/* loaded before "changed" is connected: loading is not an edit */
 	load(app);
 	g_signal_connect(n->buffer, "changed", G_CALLBACK(on_changed), app);
 
@@ -270,6 +308,7 @@ void notes_present(struct app *app)
 	gtk_widget_grab_focus(view);
 }
 
+/* Write the note now if it is unsaved. */
 void notes_shutdown(struct app *app)
 {
 	save_now(app);

@@ -4,6 +4,23 @@
  *
  * Each command changes the editor's state (shared with ua1000gui), sends the
  * resulting messages to the device and saves the state.  See ua1000ctl(1).
+ *
+ * One run is one command: main() loads the state file, a cmd_*() handler
+ * parses the command's arguments and applies them through the
+ * ua1000_edit_*() functions of ua1000_state.c, collecting the messages in
+ * struct ctl; then the messages are sent (or printed, with --dry-run) and
+ * the state is saved only when an edit changed it.  Nothing reaches the
+ * device or the state file when the command line is refused, so a typo
+ * never leaves the two out of step.
+ *
+ * This file builds no SysEx of its own: every message comes from
+ * ua1000_proto.c or ua1000_state.c, and the port from ua1000_midi.c.  It
+ * does not stay running: the device's messages are read only right after
+ * a memory load (the dump that follows it, then the device's state) and
+ * for the read command.
+ *
+ * Exit codes: 0, EXIT_RUNTIME (the device or the state file failed) or
+ * EXIT_USAGE (the command line was not understood).
  */
 #include "ua1000_midi.h"
 #include "ua1000_state.h"
@@ -23,13 +40,15 @@
 #define EXIT_RUNTIME 1
 #define EXIT_USAGE 2
 
+/* Room for the messages of one command (checked against a sync below). */
 #define OUT_MAX 128
 
+/* One run: the state, the messages to send and what to do afterwards. */
 struct ctl {
 	struct ua1000_state state;
-	size_t count;
+	size_t count; /* messages queued in out[] */
 	struct ua1000_msg out[OUT_MAX];
-	bool state_changed;
+	bool state_changed; /* the state file must be written */
 	/* after a memory load: read the device's state (it holds what the
 	 * memory loaded) once its dump has come */
 	bool read_after;
@@ -37,6 +56,10 @@ struct ctl {
 	bool listen;
 };
 
+/*
+ * Print the help text to f: stdout for --help, stderr when no command was
+ * given.  Keep it in step with ua1000ctl(1).
+ */
 static void usage(FILE *f)
 {
 	fputs("Usage: ua1000ctl [OPTION]... COMMAND [ARGUMENT]...\n"
@@ -91,6 +114,11 @@ static void usage(FILE *f)
 static int bad(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 #endif
 
+/*
+ * Report a command line that is not understood: the message, prefixed with
+ * the program's name, and a pointer to --help, on stderr.  Returns
+ * EXIT_USAGE so that a caller can write "return bad(...)".
+ */
 static int bad(const char *fmt, ...)
 {
 	va_list ap;
@@ -108,20 +136,34 @@ _Static_assert(OUT_MAX >= sizeof(((struct ua1000_sync *)0)->msg) /
 				  sizeof(struct ua1000_msg),
 	       "OUT_MAX must hold a whole sync");
 
+/*
+ * Queue count messages for sending.  No bounds check: a run is one command,
+ * and the largest one (a sync) fits, as the assertion above proves.
+ */
 static void add(struct ctl *ctl, const struct ua1000_msg *msg, size_t count)
 {
 	for (size_t i = 0; i < count; i++)
 		ctl->out[ctl->count++] = msg[i];
 }
 
+/*
+ * Queue an edit's messages and mark the state for saving.  Used by every
+ * handler whose command changes the state; user-set and sync call add().
+ */
 static void add_edit(struct ctl *ctl, const struct ua1000_edit *edit)
 {
 	add(ctl, edit->msg, edit->count);
 	ctl->state_changed = true;
 }
 
-/* ---- Argument parsing ---- */
+/*
+ * ---- Argument parsing ----
+ *
+ * Each parser returns false for a NULL, malformed or out-of-range word; the
+ * handler turns that into bad().
+ */
 
+/* A plain decimal number in min..max into *value. */
 static bool parse_uint(const char *s, unsigned int min, unsigned int max,
 		       unsigned int *value)
 {
@@ -152,6 +194,7 @@ static bool parse_choice(const char *s, const char *yes, const char *no,
 	return true;
 }
 
+/* "on" or "off", for the switches of every command. */
 static bool parse_on_off(const char *s, bool *value)
 {
 	return parse_choice(s, "on", "off", value);
@@ -201,7 +244,12 @@ static bool plain_decimal(const char *s, const char **end)
 	return digits;
 }
 
-/* "-inf", or decibels with an optional "dB", within the device's range. */
+/*
+ * "-inf", or decibels with an optional "dB" (or "db"), into a gain value.
+ * Above the device's maximum (+12 dB, with a rounding margin) is refused;
+ * there is no lower limit: ua1000_gain_from_db() rounds a very low level
+ * down to silence.
+ */
 static bool parse_db(const char *s, uint32_t *gain)
 {
 	const char *number_end;
@@ -248,6 +296,12 @@ static bool parse_pan(const char *s, uint16_t *pan)
 	return true;
 }
 
+/*
+ * A memory command's sections: "all" or NULL (the argument left out) for
+ * every section, else a comma-separated list of the names below, in the
+ * order of the bits of enum ua1000_section.  An empty list is refused, as
+ * is a list longer than the local copy strtok_r() needs.
+ */
 static bool parse_sections(const char *s, unsigned int *sections)
 {
 	static const char *const names[] = { "panel", "wave-in", "output",
@@ -275,8 +329,18 @@ static bool parse_sections(const char *s, unsigned int *sections)
 	return *sections != 0;
 }
 
-/* ---- Commands ---- */
+/*
+ * ---- Commands ----
+ *
+ * Each handler gets the command's words (argv[0] is the command's name),
+ * queues its messages in ctl and returns 0, or bad()'s EXIT_USAGE with
+ * nothing queued.  None of them touches the device: main() sends.
+ */
 
+/*
+ * input|output CH gain|pan|mute|solo VALUE, and input|output PAIR link
+ * on|off, for the mixer given.  Called by cmd_input() and cmd_output().
+ */
 static int cmd_strip(struct ctl *ctl, enum ua1000_mixer mixer, int argc,
 		     char **argv)
 {
@@ -290,6 +354,7 @@ static int cmd_strip(struct ctl *ctl, enum ua1000_mixer mixer, int argc,
 
 	const char *param = argv[2], *value = argv[3];
 
+	/* link names a pair, every other parameter a channel */
 	if (strcmp(param, "link") == 0) {
 		if (!parse_pair(argv[1], &pair))
 			return bad("'%s' is not a pair (1-2 .. 9-10)", argv[1]);
@@ -332,16 +397,23 @@ static int cmd_strip(struct ctl *ctl, enum ua1000_mixer mixer, int argc,
 	return 0;
 }
 
+/* The input command: a strip of the INPUT mixer. */
 static int cmd_input(struct ctl *ctl, int argc, char **argv)
 {
 	return cmd_strip(ctl, UA1000_MIXER_INPUT, argc, argv);
 }
 
+/* The output command: a strip of the OUTPUT mixer. */
 static int cmd_output(struct ctl *ctl, int argc, char **argv)
 {
 	return cmd_strip(ctl, UA1000_MIXER_OUTPUT, argc, argv);
 }
 
+/*
+ * monitor gain DB [left|right], or monitor link on|off.  Without a side the
+ * gain goes to both; with one while the monitor is linked, a warning says
+ * the other side follows too.
+ */
 static int cmd_monitor(struct ctl *ctl, int argc, char **argv)
 {
 	struct ua1000_edit edit;
@@ -392,6 +464,11 @@ static int cmd_monitor(struct ctl *ctl, int argc, char **argv)
 	return 0;
 }
 
+/*
+ * panel SWITCH VALUE: one switch changed in a copy of the panel, which is
+ * then written whole (the switches travel as one block).  An ADAT setting
+ * at a rate the device ignores it at is refused with EXIT_USAGE.
+ */
 static int cmd_panel(struct ctl *ctl, int argc, char **argv)
 {
 	struct ua1000_panel panel = ctl->state.panel;
@@ -430,6 +507,11 @@ static int cmd_panel(struct ctl *ctl, int argc, char **argv)
 	return 0;
 }
 
+/*
+ * route TABLE PAIR SOURCE: one pair of one patch-bay table.  A source the
+ * table does not offer (same outside output-dm-off) is refused by
+ * ua1000_edit_route().
+ */
 static int cmd_route(struct ctl *ctl, int argc, char **argv)
 {
 	enum ua1000_route_table table;
@@ -450,6 +532,10 @@ static int cmd_route(struct ctl *ctl, int argc, char **argv)
 	return 0;
 }
 
+/*
+ * preset wave-in|output NAME: one of the vendor's patch-bay presets; the
+ * other table is kept as it is.
+ */
 static int cmd_preset(struct ctl *ctl, int argc, char **argv)
 {
 	enum ua1000_wave_in_preset wave_in = UA1000_WAVE_IN_KEEP;
@@ -480,6 +566,11 @@ static int cmd_preset(struct ctl *ctl, int argc, char **argv)
 	return 0;
 }
 
+/*
+ * memory store|load SLOT [SECTIONS].  A load also asks main() to read the
+ * device afterwards (read_after), and to wait first for the dump it sends
+ * when the load touches the panel or the patch bay (listen).
+ */
 static int cmd_memory(struct ctl *ctl, int argc, char **argv)
 {
 	struct ua1000_edit edit;
@@ -509,6 +600,11 @@ static int cmd_memory(struct ctl *ctl, int argc, char **argv)
 	return 0;
 }
 
+/*
+ * user-set RATE: store the power-on settings with the panel as it is, at
+ * RATE.  The state does not change (the device runs at its rate until it
+ * is switched on again), so nothing is saved.
+ */
 static int cmd_user_set(struct ctl *ctl, int argc, char **argv)
 {
 	struct ua1000_panel panel = ctl->state.panel;
@@ -529,6 +625,10 @@ static int cmd_user_set(struct ctl *ctl, int argc, char **argv)
 	return 0;
 }
 
+/*
+ * sync: send the whole state, which also makes a mixer left unknown by a
+ * foreign memory load known again.
+ */
 static int cmd_sync(struct ctl *ctl, int argc, char **argv)
 {
 	struct ua1000_sync sync;
@@ -545,11 +645,13 @@ static int cmd_sync(struct ctl *ctl, int argc, char **argv)
 	return 0;
 }
 
+/* A command that edits the state; main() runs it by name. */
 struct command {
 	const char *name;
 	int (*run)(struct ctl *ctl, int argc, char **argv);
 };
 
+/* status, read and ports are not here: main() handles them before. */
 static const struct command commands[] = {
 	{ "input", cmd_input },	    { "output", cmd_output },
 	{ "monitor", cmd_monitor }, { "panel", cmd_panel },
@@ -560,6 +662,7 @@ static const struct command commands[] = {
 
 /* ---- Main ---- */
 
+/* --dry-run: each queued message on its own line, in hex bytes. */
 static void print_messages(const struct ctl *ctl)
 {
 	for (size_t i = 0; i < ctl->count; i++) {
@@ -569,11 +672,18 @@ static void print_messages(const struct ctl *ctl)
 	}
 }
 
+/*
+ * ua1000_midi_receive() handler for read_dump(): apply what the device
+ * reported (its panel or patch bay after a load) to the state.  Messages
+ * that decode to nothing known are ignored.
+ */
 static void on_device_message(const struct ua1000_dt1 *dt1, void *data)
 {
 	struct ctl *ctl = data;
 	struct ua1000_event event = { 0 };
 
+	/* the decoder fills in only what the message carries: start it from
+	 * the state, so the rest of the panel and patch bay stays as is */
 	event.panel = ctl->state.panel;
 	event.patchbay = ctl->state.patchbay;
 	ua1000_decode(dt1, &event);
@@ -590,6 +700,11 @@ static void on_device_message(const struct ua1000_dt1 *dt1, void *data)
  */
 #define DUMP_WAIT_MS 1000
 
+/*
+ * Apply whatever the device sends until it has been quiet for DUMP_WAIT_MS.
+ * Called by send_messages() after a load (ctl->listen).  Returns 0, or the
+ * negative errno of a failed port.
+ */
 static int read_dump(struct ctl *ctl, struct ua1000_midi *midi)
 {
 	struct pollfd fds[4];
@@ -606,12 +721,20 @@ static int read_dump(struct ctl *ctl, struct ua1000_midi *midi)
 
 /* ---- read ---- */
 
+/*
+ * The answer to a block request, kept past the receive call: dt1.data
+ * points into data, since the receive buffer is reused.
+ */
 struct block_wait {
 	uint8_t data[UA1000_GLOBAL_BLOCK_SIZE];
 	struct ua1000_dt1 dt1;
 	bool got;
 };
 
+/*
+ * ua1000_midi_receive() handler for read_device() and cmd_read(): keep the
+ * first message that is the whole current block, ignore everything else.
+ */
 static void on_block(const struct ua1000_dt1 *dt1, void *data)
 {
 	struct block_wait *w = data;
@@ -631,6 +754,8 @@ static void on_block(const struct ua1000_dt1 *dt1, void *data)
  * the memory loaded, and take it (keeping the solos and the memories this
  * editor stored, and giving the device the solos).  Without an answer the
  * state keeps what it had, and says so if the mixer is not known.
+ * Called by send_messages() when ctl->read_after is set.  Returns 0 (with
+ * or without an answer), or the negative errno of a failed port.
  */
 static int read_device(struct ctl *ctl, struct ua1000_midi *midi)
 {
@@ -666,6 +791,13 @@ static int read_device(struct ctl *ctl, struct ua1000_midi *midi)
 	return err == 0 ? ua1000_midi_drain(midi) : err;
 }
 
+/*
+ * Open the port (the one given, or the device's, found by name), send the
+ * queued messages and wait for them to leave; after a memory load, also
+ * take the dump and the device's state.  The port is closed before
+ * returning, so another program can open it.  Errors are reported here;
+ * returns 0 or EXIT_RUNTIME.
+ */
 static int send_messages(struct ctl *ctl, const char *port)
 {
 	char found[32];
@@ -703,7 +835,12 @@ static int send_messages(struct ctl *ctl, const char *port)
 	return 0;
 }
 
-/* Ask the device for its state block and print what it holds. */
+/*
+ * The read command: ask the device for its state block and print what it
+ * holds, in the state file's format, on stdout.  The state file is not
+ * changed.  With dry_run, print the request instead.  Returns 0,
+ * or EXIT_RUNTIME when the port fails or the device gives no usable answer.
+ */
 static int cmd_read(const char *port, bool dry_run)
 {
 	static struct block_wait wait;
@@ -774,6 +911,13 @@ static int cmd_read(const char *port, bool dry_run)
 	return 0;
 }
 
+/*
+ * Options, then the command.  ports, read and status need no edit; every
+ * other command goes through the commands[] table, then send_messages(),
+ * then the state file.  Options end at the first word without a leading
+ * '-', so an argument such as -inf or -6 after the command is not taken
+ * for one.
+ */
 int main(int argc, char **argv)
 {
 	static struct ctl ctl;
@@ -814,6 +958,7 @@ int main(int argc, char **argv)
 
 	const char *name = argv[i];
 
+	/* listing the ports needs no state file */
 	if (strcmp(name, "ports") == 0) {
 		ua1000_midi_list(stdout);
 		return 0;
@@ -879,6 +1024,8 @@ int main(int argc, char **argv)
 	ret = send_messages(&ctl, port);
 	if (ret != 0)
 		return ret;
+	/* saved only after a successful send: when the send fails, the file
+	 * keeps the state as it was before this command */
 	if (ctl.state_changed) {
 		int err_save = ua1000_statefile_save(state_path, &ctl.state);
 

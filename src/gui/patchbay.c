@@ -4,6 +4,16 @@
  *
  * The window is hidden, not destroyed, when closed, so its widgets live as
  * long as the application and app_refresh() can always reach them.
+ *
+ * One dropdown per pair of each routing table (app->patchbay.route), built
+ * the first time the window is presented; until then patchbay_refresh()
+ * has nothing to update.  A dropdown's position maps to a source through
+ * sources[], with "(same as DM ON)" in front for the DM ALL OFF table only.
+ * Every change, a dropdown's or a preset button's, goes through
+ * ua1000_edit_route() or ua1000_edit_preset() and app_apply(); the widgets
+ * hold no routing of their own.
+ *
+ * Used by toolbar.c (the app.patchbay action) and by app_refresh().
  */
 #include "app.h"
 
@@ -25,17 +35,23 @@ static const char *const source_labels[] = {
 
 #define N_SOURCES G_N_ELEMENTS(sources)
 
+/* What a dropdown edits; owned by the dropdown (freed with it). */
 struct route_ref {
 	struct app *app;
 	enum ua1000_route_table table;
 	unsigned int pair;
 };
 
+/* Whether the table offers "same as DM ON" (only DM ALL OFF does). */
 static bool has_same(enum ua1000_route_table table)
 {
 	return table == UA1000_ROUTE_OUTPUT_DM_OFF;
 }
 
+/*
+ * The dropdown position that shows source in table: the inverse of
+ * source_at().  A source not in the list shows as the first entry.
+ */
 static guint source_index(enum ua1000_route_table table, unsigned int source)
 {
 	guint offset = has_same(table) ? 1 : 0;
@@ -48,6 +64,10 @@ static guint source_index(enum ua1000_route_table table, unsigned int source)
 	return 0;
 }
 
+/*
+ * The source at a dropdown position of table.  A position past the list
+ * gives MONITOR OUT; ua1000_edit_route() checks the result anyway.
+ */
 static enum ua1000_source source_at(enum ua1000_route_table table, guint index)
 {
 	if (has_same(table)) {
@@ -58,6 +78,10 @@ static enum ua1000_source source_at(enum ua1000_route_table table, guint index)
 	return index < N_SOURCES ? sources[index] : UA1000_SRC_MONITOR_OUT;
 }
 
+/*
+ * "notify::selected" of a route dropdown: route that pair to the chosen
+ * source.  Ignored while app_refresh() is setting the dropdowns.
+ */
 static void on_route(GtkDropDown *dropdown, GParamSpec *pspec, gpointer data)
 {
 	struct route_ref *ref = data;
@@ -74,6 +98,10 @@ static void on_route(GtkDropDown *dropdown, GParamSpec *pspec, gpointer data)
 	app_apply(app, ret, &edit, false);
 }
 
+/*
+ * A dropdown for one pair of one table, its entries in sources[] order,
+ * stored in app->patchbay.route so that patchbay_refresh() can set it.
+ */
 static GtkWidget *route_new(struct app *app, enum ua1000_route_table table,
 			    unsigned int pair)
 {
@@ -99,6 +127,7 @@ static GtkWidget *route_new(struct app *app, enum ua1000_route_table table,
 	return dropdown;
 }
 
+/* Apply a preset to one table (the other given as KEEP). */
 static void preset(struct app *app, enum ua1000_wave_in_preset wave_in,
 		   enum ua1000_output_preset output)
 {
@@ -109,36 +138,45 @@ static void preset(struct app *app, enum ua1000_wave_in_preset wave_in,
 	app_apply(app, ret, &edit, false);
 }
 
+/*
+ * The preset buttons' "clicked" handlers, one per preset; data is the
+ * struct app.  WAVE IN: Initial Setting.
+ */
 static void on_wave_in_initial(GtkButton *b, gpointer app)
 {
 	(void)b;
 	preset(app, UA1000_WAVE_IN_INITIAL, UA1000_OUTPUT_KEEP);
 }
 
+/* WAVE IN: Loop Back. */
 static void on_wave_in_loop_back(GtkButton *b, gpointer app)
 {
 	(void)b;
 	preset(app, UA1000_WAVE_IN_LOOP_BACK, UA1000_OUTPUT_KEEP);
 }
 
+/* OUTPUT: Initial Setting. */
 static void on_output_initial(GtkButton *b, gpointer app)
 {
 	(void)b;
 	preset(app, UA1000_WAVE_IN_KEEP, UA1000_OUTPUT_INITIAL);
 }
 
+/* OUTPUT: Hard Thru. */
 static void on_output_hard_thru(GtkButton *b, gpointer app)
 {
 	(void)b;
 	preset(app, UA1000_WAVE_IN_KEEP, UA1000_OUTPUT_HARD_THRU);
 }
 
+/* OUTPUT: Monitor Out. */
 static void on_output_monitor_out(GtkButton *b, gpointer app)
 {
 	(void)b;
 	preset(app, UA1000_WAVE_IN_KEEP, UA1000_OUTPUT_MONITOR_OUT);
 }
 
+/* A button that calls callback with app when clicked. */
 static GtkWidget *button_new(const char *label, GCallback callback,
 			     struct app *app)
 {
@@ -148,6 +186,7 @@ static GtkWidget *button_new(const char *label, GCallback callback,
 	return button;
 }
 
+/* A column title for the OUTPUT grid, styled as a heading. */
 static GtkWidget *column_header(const char *text)
 {
 	GtkWidget *label = gtk_label_new(text);
@@ -156,6 +195,7 @@ static GtkWidget *column_header(const char *text)
 	return label;
 }
 
+/* A row title: the table's name and the pair, "OUTPUT 3-4". */
 static GtkWidget *pair_label(const char *table, unsigned int pair)
 {
 	gchar *text =
@@ -167,7 +207,10 @@ static GtkWidget *pair_label(const char *table, unsigned int pair)
 	return label;
 }
 
-/* A screen reader names a route by its row's label (and its column's). */
+/*
+ * A screen reader names a route by its row's label (and its column's, NULL
+ * when there is none).  Returns the dropdown, for use inside a call.
+ */
 static GtkWidget *labelled(GtkWidget *dropdown, GtkWidget *row,
 			   GtkWidget *column)
 {
@@ -185,6 +228,7 @@ static GtkWidget *labelled(GtkWidget *dropdown, GtkWidget *row,
 	return dropdown;
 }
 
+/* The WAVE IN frame: its two preset buttons and one route per pair. */
 static GtkWidget *wave_in_frame(struct app *app)
 {
 	GtkWidget *frame = gtk_frame_new("WAVE IN — what the computer records");
@@ -219,6 +263,10 @@ static GtkWidget *wave_in_frame(struct app *app)
 	return frame;
 }
 
+/*
+ * The OUTPUT frame: its three preset buttons and a grid with one row per
+ * pair, a column for direct monitor on and one for all off.
+ */
 static GtkWidget *output_frame(struct app *app)
 {
 	GtkWidget *frame = gtk_frame_new("OUTPUT — what each output plays");
@@ -268,6 +316,7 @@ static GtkWidget *output_frame(struct app *app)
 	return frame;
 }
 
+/* Show the PATCH BAY window, building it the first time. */
 void patchbay_present(struct app *app)
 {
 	struct patchbay_widgets *pb = &app->patchbay;
@@ -288,6 +337,8 @@ void patchbay_present(struct app *app)
 		gtk_widget_set_margin_top(row, 12);
 		gtk_widget_set_margin_bottom(row, 12);
 		gtk_window_set_child(GTK_WINDOW(pb->window), row);
+		/* the new dropdowns show the state without their handlers
+		 * sending it back as edits */
 		bool was = app->refreshing;
 
 		app->refreshing = true;
@@ -297,10 +348,12 @@ void patchbay_present(struct app *app)
 	gtk_window_present(GTK_WINDOW(pb->window));
 }
 
+/* Make the route dropdowns show the state; nothing to do before they exist. */
 void patchbay_refresh(struct app *app)
 {
 	if (!app->patchbay.window)
 		return;
+	/* the tables are numbered 0..2, as route[] is indexed */
 	for (int t = UA1000_ROUTE_WAVE_IN; t <= UA1000_ROUTE_OUTPUT_DM_OFF; t++)
 		for (unsigned int pair = 0; pair < UA1000_PAIRS; pair++)
 			gtk_drop_down_set_selected(

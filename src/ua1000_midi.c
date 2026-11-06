@@ -1,6 +1,23 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * ua1000_midi.c - the UA-1000's MIDI port, through ALSA rawmidi
+ *
+ * The only module that talks to ALSA.  It finds the UA-1000's card and its
+ * control port (USB-MIDI cable 1) by name, reads the running sample rate from
+ * the card's long name, opens the port, and carries the messages built by
+ * ua1000_proto.c to the device and the device's messages back.
+ *
+ * The port is opened non-blocking and stays so: every wait here is bounded by
+ * UA1000_MIDI_WRITE_TIMEOUT_MS, because a caller may be a GUI's main loop and
+ * a device that stops taking bytes must not freeze it.  For the same reason a
+ * close drops what the device has not taken instead of letting the kernel
+ * drain it.
+ *
+ * Incoming bytes go through a struct ua1000_reader kept in the handle, so a
+ * message split across reads still arrives whole.  The module does not
+ * decode messages (ua1000_decode() does) nor keep any state of the device.
+ *
+ * Used by ua1000ctl.c and the GUI under src/gui/.
  */
 #include "ua1000_midi.h"
 
@@ -14,13 +31,20 @@
 /* The card name the snd-ua101 driver registers for the UA-1000. */
 #define CARD_NAME "UA-1000"
 
+/*
+ * An open port.  in is NULL for a port opened without input; reader holds a
+ * message whose bytes have not all arrived yet.
+ */
 struct ua1000_midi {
 	snd_rawmidi_t *in;
 	snd_rawmidi_t *out;
 	struct ua1000_reader reader;
 };
 
-/* What one card is, read once per card. */
+/*
+ * What one card is, read once per card.  ctl, longname and id are valid only
+ * during the visitor's call: each_card() closes the card and reuses the info.
+ */
 struct card {
 	int index;
 	snd_ctl_t *ctl;
@@ -32,6 +56,12 @@ struct card {
 /* Call visit for every card; stop when it returns true. */
 typedef bool card_visitor(const struct card *card, void *data);
 
+/*
+ * Open the control interface of each card in turn and pass what the card is
+ * to visit, until visit returns true or the cards run out.  A card that
+ * cannot be opened or queried is skipped; if the info cannot be allocated,
+ * nothing is visited.
+ */
 static void each_card(card_visitor *visit, void *data)
 {
 	snd_ctl_card_info_t *info;
@@ -73,6 +103,12 @@ typedef bool substream_visitor(const struct card *card, int device,
 			       unsigned int subdevice, const char *name,
 			       void *data);
 
+/*
+ * Walk the output substreams of every rawmidi device of card until visit
+ * returns true; returns whether one did.  A device's subdevice count is known
+ * only after its first query, hence count starts at 1.  A device without an
+ * output stream fails that query and is skipped.
+ */
 static bool each_substream(const struct card *card, substream_visitor *visit,
 			   void *data)
 {
@@ -102,6 +138,10 @@ static bool each_substream(const struct card *card, substream_visitor *visit,
 	return stop;
 }
 
+/*
+ * Whether a substream name is a control port's: CONTROL_SUFFIX after a
+ * non-empty card name.
+ */
 static bool is_control(const char *name)
 {
 	size_t len = strlen(name), suffix = strlen(CONTROL_SUFFIX);
@@ -109,6 +149,7 @@ static bool is_control(const char *name)
 	return len > suffix && strcmp(name + len - suffix, CONTROL_SUFFIX) == 0;
 }
 
+/* What ua1000_midi_find() looks for, and what it found. */
 struct find {
 	char *port;
 	size_t len;
@@ -116,6 +157,7 @@ struct find {
 	bool found;
 };
 
+/* Substream visitor: name the first control port in f->port, and stop. */
 static bool find_control(const struct card *card, int device,
 			 unsigned int subdevice, const char *name, void *data)
 {
@@ -129,6 +171,11 @@ static bool find_control(const struct card *card, int device,
 	return true;
 }
 
+/*
+ * Card visitor: search a UA-1000's substreams, pass every other card.  The
+ * walk stops only once a control port is found, so a second UA-1000 is
+ * searched when the first has none.
+ */
 static bool find_visitor(const struct card *card, void *data)
 {
 	struct find *f = data;
@@ -139,6 +186,7 @@ static bool find_visitor(const struct card *card, void *data)
 	return each_substream(card, find_control, data);
 }
 
+/* The first control port of a UA-1000; see the header for the errors. */
 int ua1000_midi_find(char *port, size_t len)
 {
 	struct find f = { .port = port, .len = len };
@@ -149,6 +197,7 @@ int ua1000_midi_find(char *port, size_t len)
 	return f.card_found ? -ENXIO : -ENODEV;
 }
 
+/* Parse the rate out of the driver's long name; see the header. */
 bool ua1000_midi_rate_from_longname(const char *longname, unsigned int *hz)
 {
 	/* The serial number is in parentheses; the rate follows them. */
@@ -169,11 +218,13 @@ bool ua1000_midi_rate_from_longname(const char *longname, unsigned int *hz)
 	return true;
 }
 
+/* What ua1000_midi_card_rate() found. */
 struct rate {
 	unsigned int hz;
 	bool found;
 };
 
+/* Card visitor: parse the first UA-1000's long name, and stop there. */
 static bool rate_visitor(const struct card *card, void *data)
 {
 	struct rate *r = data;
@@ -184,6 +235,10 @@ static bool rate_visitor(const struct card *card, void *data)
 	return true;
 }
 
+/*
+ * The first UA-1000's running rate; -ENODEV also when its long name carries
+ * no rate.
+ */
 int ua1000_midi_card_rate(unsigned int *hz)
 {
 	struct rate r = { 0 };
@@ -195,6 +250,7 @@ int ua1000_midi_card_rate(unsigned int *hz)
 	return 0;
 }
 
+/* What ua1000_midi_card() found. */
 struct card_found {
 	int index;
 	char *id;
@@ -202,6 +258,7 @@ struct card_found {
 	bool found;
 };
 
+/* Card visitor: take the first UA-1000's index and id, and stop. */
 static bool card_visitor_ua1000(const struct card *card, void *data)
 {
 	struct card_found *f = data;
@@ -214,6 +271,7 @@ static bool card_visitor_ua1000(const struct card *card, void *data)
 	return true;
 }
 
+/* The first UA-1000 card; see the header. */
 int ua1000_midi_card(int *index, char *id, size_t len)
 {
 	struct card_found f = { .id = id, .len = len };
@@ -225,6 +283,10 @@ int ua1000_midi_card(int *index, char *id, size_t len)
 	return 0;
 }
 
+/*
+ * Substream visitor: print one port to the FILE in data, marking the
+ * UA-1000's control port.  Never stops the walk.
+ */
 static bool list_substream(const struct card *card, int device,
 			   unsigned int subdevice, const char *name, void *data)
 {
@@ -235,17 +297,20 @@ static bool list_substream(const struct card *card, int device,
 	return false;
 }
 
+/* Card visitor: list the card's output ports, then go on to the next. */
 static bool list_visitor(const struct card *card, void *data)
 {
 	each_substream(card, list_substream, data);
 	return false;
 }
 
+/* List every rawmidi output port of every card; see the header. */
 void ua1000_midi_list(FILE *out)
 {
 	each_card(list_visitor, out);
 }
 
+/* Open port, with its input when asked; see the header. */
 int ua1000_midi_open(struct ua1000_midi **midi, const char *port,
 		     bool with_input)
 {
@@ -276,7 +341,7 @@ int ua1000_midi_open(struct ua1000_midi **midi, const char *port,
 	/*
 	 * Start the input now: the kernel starts a rawmidi input only at its
 	 * first read or poll, and what the device sends before that is lost.
-	 * Measured: a GUI that asked for the device's state as it connected,
+	 * Observed: a GUI that asked for the device's state as it connected,
 	 * and first polled after its window was built, never got the answer;
 	 * the same request sent once its main loop ran got it in 3-32 ms.
 	 * A poll that does not wait starts it, and consumes nothing.
@@ -296,7 +361,11 @@ fail:
 	return err;
 }
 
-/* 1 while bytes wait in the output buffer, 0 when it is empty, -errno. */
+/*
+ * 1 while bytes wait in the output buffer, 0 when it is empty, -errno.  Bytes
+ * wait while the room available is less than the whole buffer.  Close and
+ * drain use it instead of the kernel's drain, which may wait for seconds.
+ */
 static int output_pending(snd_rawmidi_t *out)
 {
 	snd_rawmidi_params_t *params = NULL;
@@ -344,6 +413,8 @@ void ua1000_midi_close(struct ua1000_midi *midi)
  * The output buffer is full: wait until the device takes some of it.  A
  * device that takes nothing for UA1000_MIDI_WRITE_TIMEOUT_MS is reported,
  * -ETIMEDOUT, rather than waited for: the caller is a GUI's main loop.
+ * Returns 0 once there is room, -ENODEV when the port reports an error or a
+ * hang-up (the device was unplugged, for instance), or a negative errno.
  */
 static int wait_for_room(struct ua1000_midi *midi)
 {
@@ -370,6 +441,7 @@ static int wait_for_room(struct ua1000_midi *midi)
 	return 0;
 }
 
+/* Write count messages whole, in order; see the header. */
 int ua1000_midi_send(struct ua1000_midi *midi, const struct ua1000_msg *msg,
 		     size_t count)
 {
@@ -404,7 +476,8 @@ int ua1000_midi_send(struct ua1000_midi *midi, const struct ua1000_msg *msg,
  * Wait until the output buffer is empty, UA1000_MIDI_WRITE_TIMEOUT_MS at most,
  * by polling its status: the kernel's own drain (snd_rawmidi_drain) waits
  * up to 10 s for a device that stopped taking bytes.  On a timeout the
- * rest is dropped, so the close that follows does not wait either.
+ * rest is dropped, so the close that follows does not wait either.  The
+ * timeout counts the 10 ms steps slept, not the time spent in between.
  */
 int ua1000_midi_drain(struct ua1000_midi *midi)
 {
@@ -423,6 +496,7 @@ int ua1000_midi_drain(struct ua1000_midi *midi)
 	}
 }
 
+/* The input's descriptors; none for a port opened without input. */
 int ua1000_midi_poll_descriptors(struct ua1000_midi *midi, struct pollfd *fds,
 				 int max)
 {
@@ -431,6 +505,11 @@ int ua1000_midi_poll_descriptors(struct ua1000_midi *midi, struct pollfd *fds,
 	return snd_rawmidi_poll_descriptors(midi->in, fds, (unsigned int)max);
 }
 
+/*
+ * Read until the input would block, handing each complete, well-formed DT1
+ * to handler.  Anything else (another SysEx, a bad checksum) is dropped
+ * without a word.
+ */
 int ua1000_midi_receive(struct ua1000_midi *midi, ua1000_midi_handler *handler,
 			void *data)
 {
@@ -458,6 +537,10 @@ int ua1000_midi_receive(struct ua1000_midi *midi, ua1000_midi_handler *handler,
 	}
 }
 
+/*
+ * A cause worth naming for the errors these functions return on their own,
+ * and ALSA's description for the rest.
+ */
 const char *ua1000_midi_strerror(int err)
 {
 	switch (err) {

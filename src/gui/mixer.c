@@ -5,12 +5,24 @@
  * Faders are GtkScales over the vendor's 1023 fader positions, so they move
  * through the same gains as the vendor's panel and get keyboard, scroll and
  * accessibility support from GTK.  They show their value in dB.
+ *
+ * mixer_create() makes every strip's, link's and MONITOR OUT's control and
+ * wires it to the state: each handler turns the widget's new value into an
+ * ua1000_edit_*() call and hands the result to app_apply(), and does nothing
+ * while app->refreshing is set (app_refresh() moving the widgets).  The
+ * widgets live in struct app; mixer_refresh() makes them show the state.
+ * Both layouts use them: mixer_new() puts them in GTK boxes (the plain
+ * layout), desk.c lays them out on its panel.  A double click on a fader or
+ * pan resets it; desk.c uses app_double_press() for its own caps too.
+ *
+ * The module holds no settings of its own and draws no meters.  GTK main
+ * thread only.
  */
 #include "app.h"
 
 #include <math.h>
 
-/* Where a strip's widgets point back to. */
+/* Where a strip's widgets point back to; owned by one of those widgets. */
 struct strip_ref {
 	struct app *app;
 	enum ua1000_mixer mixer;
@@ -27,6 +39,7 @@ static void describe(GtkWidget *widget, const char *what)
 				       GTK_ACCESSIBLE_PROPERTY_LABEL, what, -1);
 }
 
+/* describe() in a strip's words: "Input 3 gain", "Output 1-2 link". */
 static void describe_channel(GtkWidget *widget, enum ua1000_mixer mixer,
 			     const char *channels, const char *what)
 {
@@ -38,6 +51,10 @@ static void describe_channel(GtkWidget *widget, enum ua1000_mixer mixer,
 	describe(widget, text);
 }
 
+/*
+ * A fader's value text (GtkScale format function): its gain in dB, "-inf"
+ * at the bottom, a rounding to zero shown as +0.0.
+ */
 static char *format_gain(GtkScale *scale, double position, gpointer data)
 {
 	double db;
@@ -50,6 +67,7 @@ static char *format_gain(GtkScale *scale, double position, gpointer data)
 	return g_strdup_printf("%+.1f", fabs(db) < 0.05 ? 0.0 : db);
 }
 
+/* Mark a gain, in dB, on a fader's scale, with an optional label. */
 static void add_mark(GtkWidget *fader, double db, const char *text)
 {
 	unsigned int position = ua1000_gain_to_fader(ua1000_gain_from_db(db));
@@ -61,6 +79,10 @@ static void add_mark(GtkWidget *fader, double db, const char *text)
  * A double click returns a control to its default, as on most software
  * mixers: a fader to 0 dB, the state's default
  * for every strip and the monitor, a pan to the centre.
+ *
+ * app_double_press() keeps the time of the control's last press on the
+ * control itself; a pair of presses resets it, so a third press starts a
+ * new pair.
  */
 bool app_double_press(GObject *control)
 {
@@ -80,6 +102,13 @@ bool app_double_press(GObject *control)
 	return twice;
 }
 
+/*
+ * The "pressed" handler reset_on_double_click() installs, in the capture
+ * phase, before the range's own gesture.  The second press of a double
+ * press sets the range to its "default-value" and claims the press; any
+ * other press is claimed when it lands on the travel off the slider (when a
+ * slider is drawn).
+ */
 static void on_double_click(GtkGestureClick *gesture, int n, double x, double y,
 			    gpointer data)
 {
@@ -115,6 +144,7 @@ static void on_double_click(GtkGestureClick *gesture, int n, double x, double y,
 	gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_CLAIMED);
 }
 
+/* Make a double click on range set it to value. */
 static void reset_on_double_click(GtkWidget *range, int value)
 {
 	GtkGesture *click = gtk_gesture_click_new();
@@ -130,6 +160,11 @@ static void reset_on_double_click(GtkWidget *range, int value)
 	gtk_widget_add_controller(range, GTK_EVENT_CONTROLLER(click));
 }
 
+/*
+ * A vertical fader over the positions 0..UA1000_FADER_MAX, loudest at the
+ * top, showing its gain in dB, marked from +12 to -48 dB, reset to unity
+ * by a double click.  Not yet wired to the state.
+ */
 static GtkWidget *fader_new(void)
 {
 	GtkWidget *fader = gtk_scale_new_with_range(GTK_ORIENTATION_VERTICAL, 0,
@@ -153,11 +188,13 @@ static GtkWidget *fader_new(void)
 	return fader;
 }
 
+/* Move a fader to the position of a gain (the device's value). */
 static void fader_set_gain(GtkWidget *fader, uint32_t gain)
 {
 	gtk_range_set_value(GTK_RANGE(fader), ua1000_gain_to_fader(gain));
 }
 
+/* The gain at a fader's position, the position rounded. */
 static uint32_t fader_get_gain(GtkWidget *fader)
 {
 	double position = gtk_range_get_value(GTK_RANGE(fader));
@@ -165,6 +202,7 @@ static uint32_t fader_get_gain(GtkWidget *fader)
 	return ua1000_fader_to_gain((unsigned int)lround(position));
 }
 
+/* A pan position as text, to g_free(). */
 char *mixer_pan_text(double position)
 {
 	long p = lround(position);
@@ -174,6 +212,7 @@ char *mixer_pan_text(double position)
 	return g_strdup_printf("%c%ld", p < 0 ? 'L' : 'R', labs(p));
 }
 
+/* A pan's value text (GtkScale format function): mixer_pan_text(). */
 static char *format_pan(GtkScale *scale, double position, gpointer data)
 {
 	(void)scale;
@@ -181,6 +220,10 @@ static char *format_pan(GtkScale *scale, double position, gpointer data)
 	return mixer_pan_text(position);
 }
 
+/*
+ * A horizontal pan over -UA1000_PAN_STEPS..UA1000_PAN_STEPS, the centre
+ * marked, reset to the centre by a double click.  Not yet wired.
+ */
 static GtkWidget *pan_new(void)
 {
 	GtkWidget *pan = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL,
@@ -199,6 +242,12 @@ static GtkWidget *pan_new(void)
 
 /* ---- Callbacks ---- */
 
+/*
+ * The controls' signal handlers.  Faders and pans are continuous edits
+ * (dragged, bracketed in a gesture by app_apply()); toggles are not.
+ */
+
+/* A strip fader's "value-changed": the channel's gain. */
 static void on_fader(GtkRange *range, gpointer data)
 {
 	struct strip_ref *ref = data;
@@ -213,6 +262,7 @@ static void on_fader(GtkRange *range, gpointer data)
 	app_apply(app, ret, &edit, true);
 }
 
+/* A pan's "value-changed": the channel's pan. */
 static void on_pan(GtkRange *range, gpointer data)
 {
 	struct strip_ref *ref = data;
@@ -228,6 +278,7 @@ static void on_pan(GtkRange *range, gpointer data)
 	app_apply(app, ret, &edit, true);
 }
 
+/* M's "toggled": the channel's mute. */
 static void on_mute(GtkToggleButton *button, gpointer data)
 {
 	struct strip_ref *ref = data;
@@ -242,6 +293,7 @@ static void on_mute(GtkToggleButton *button, gpointer data)
 	app_apply(app, ret, &edit, false);
 }
 
+/* S's "toggled": the channel's solo. */
 static void on_solo(GtkToggleButton *button, gpointer data)
 {
 	struct strip_ref *ref = data;
@@ -256,7 +308,7 @@ static void on_solo(GtkToggleButton *button, gpointer data)
 	app_apply(app, ret, &edit, false);
 }
 
-/* For a pair, ref->channel is the pair's first channel. */
+/* A pair's LINK "toggled"; for a pair, ref->channel is its first channel. */
 static void on_link(GtkToggleButton *button, gpointer data)
 {
 	struct strip_ref *ref = data;
@@ -271,6 +323,7 @@ static void on_link(GtkToggleButton *button, gpointer data)
 	app_apply(app, ret, &edit, false);
 }
 
+/* A MONITOR OUT fader's "value-changed"; the widget tells the side. */
 static void on_monitor_fader(GtkRange *range, gpointer data)
 {
 	struct app *app = data;
@@ -287,6 +340,7 @@ static void on_monitor_fader(GtkRange *range, gpointer data)
 	app_apply(app, ret, &edit, true);
 }
 
+/* MONITOR OUT's LINK "toggled". */
 static void on_monitor_link(GtkToggleButton *button, gpointer data)
 {
 	struct app *app = data;
@@ -302,6 +356,10 @@ static void on_monitor_link(GtkToggleButton *button, gpointer data)
 
 /* ---- Construction ---- */
 
+/*
+ * The strip_ref a channel's (or a pair's) handlers get, owned by holder:
+ * one widget of those it serves, destroyed with the others.
+ */
 static struct strip_ref *ref_new(GtkWidget *holder, struct app *app,
 				 enum ua1000_mixer mixer, unsigned int channel)
 {
@@ -315,6 +373,7 @@ static struct strip_ref *ref_new(GtkWidget *holder, struct app *app,
 	return ref;
 }
 
+/* A small toggle button whose CSS class gives its checked colour. */
 static GtkWidget *toggle_new(const char *label, const char *css)
 {
 	GtkWidget *button = gtk_toggle_button_new_with_label(label);
@@ -351,6 +410,7 @@ static void strip_create(struct app *app, enum ua1000_mixer mixer,
 	g_signal_connect(w->fader, "value-changed", G_CALLBACK(on_fader), ref);
 }
 
+/* A pair's LINK toggle, kept in app->link and wired to the state. */
 static void link_create(struct app *app, enum ua1000_mixer mixer,
 			unsigned int pair)
 {
@@ -365,6 +425,7 @@ static void link_create(struct app *app, enum ua1000_mixer mixer,
 	g_signal_connect(link, "toggled", G_CALLBACK(on_link), ref);
 }
 
+/* Create every mixer control in struct app and wire it to the state. */
 void mixer_create(struct app *app)
 {
 	for (int m = UA1000_MIXER_INPUT; m <= UA1000_MIXER_OUTPUT; m++) {
@@ -389,6 +450,7 @@ void mixer_create(struct app *app)
 
 /* ---- The plain layout: GTK's own widgets in boxes ---- */
 
+/* A channel's column: its number, M, S, pan and fader. */
 static GtkWidget *strip_box(struct app *app, enum ua1000_mixer mixer,
 			    unsigned int channel)
 {
@@ -409,6 +471,9 @@ static GtkWidget *strip_box(struct app *app, enum ua1000_mixer mixer,
 	return box;
 }
 
+/*
+ * A mixer's frame: its strips in pairs, each pair over its LINK toggle.
+ */
 static GtkWidget *section_box(struct app *app, enum ua1000_mixer mixer)
 {
 	GtkWidget *frame = gtk_frame_new(mixer == UA1000_MIXER_INPUT
@@ -436,6 +501,7 @@ static GtkWidget *section_box(struct app *app, enum ua1000_mixer mixer)
 	return frame;
 }
 
+/* MONITOR OUT's frame: the L and R faders over their LINK. */
 static GtkWidget *monitor_box(struct app *app)
 {
 	GtkWidget *frame = gtk_frame_new("MONITOR OUT");
@@ -462,6 +528,7 @@ static GtkWidget *monitor_box(struct app *app)
 	return frame;
 }
 
+/* The plain layout's mixer row: INPUT, OUTPUT and MONITOR OUT. */
 GtkWidget *mixer_new(struct app *app)
 {
 	GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
@@ -477,6 +544,7 @@ GtkWidget *mixer_new(struct app *app)
 	return row;
 }
 
+/* Set every mixer control from the state. */
 void mixer_refresh(struct app *app)
 {
 	const struct ua1000_state *st = &app->state;

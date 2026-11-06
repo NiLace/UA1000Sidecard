@@ -1,6 +1,15 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * ua1000gui.c - control panel for the Roland/EDIROL UA-1000
+ *
+ * The program's entry point, and nothing else: it reads its own options
+ * (-p, -s), loads the state file through app_load(), and runs a
+ * GtkApplication whose activate builds the window (app_build()) and whose
+ * shutdown saves and releases it (app_shutdown()).  The panel itself, the
+ * device link and the state file are app.c's and the modules it calls.
+ *
+ * Every run is its own instance (G_APPLICATION_NON_UNIQUE) and GTK never
+ * sees the command line beyond the program's name.
  */
 #include "app.h"
 
@@ -9,6 +18,7 @@
 #define APP_ID "org.nylarea.ua1000gui"
 #define VERSION "0.2"
 
+/* "activate": build the window the first time, then raise it. */
 static void on_activate(GtkApplication *gtk, gpointer data)
 {
 	struct app *app = data;
@@ -19,12 +29,14 @@ static void on_activate(GtkApplication *gtk, gpointer data)
 	gtk_window_present(app->window);
 }
 
+/* "shutdown": save what is pending and release everything. */
 static void on_shutdown(GApplication *gtk, gpointer data)
 {
 	(void)gtk;
 	app_shutdown(data);
 }
 
+/* Print the usage to f; returns status, for main() to return. */
 static int usage(FILE *f, int status)
 {
 	fputs("Usage: ua1000gui [-p PORT] [-s STATE_FILE]\n"
@@ -40,6 +52,10 @@ static int usage(FILE *f, int status)
 	return status;
 }
 
+/*
+ * Parse the options, load the state file, then run the GtkApplication.
+ * app is static, so it starts zeroed: no window, no device, no desk.
+ */
 int main(int argc, char **argv)
 {
 	static struct app app;

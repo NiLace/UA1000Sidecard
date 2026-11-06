@@ -21,6 +21,7 @@ struct meters;
 /* NULL without libjack, without a JACK server (PipeWire's or jackd) or
  * without the UA-1000's ports: no meters, nothing else changes. */
 struct meters *meters_open(void);
+/* Close the client and unload libjack; NULL is ignored. */
 void meters_close(struct meters *m);
 /* Whether a JACK port alias "alsa_pcm:<device>:..." names the ALSA card
  * index or id ("hw:2", "hw:UA1000,0"); true for an alias that is not an

@@ -117,7 +117,11 @@ struct ua1000_panel {
 	bool clock_flag;
 };
 
-/* The panel of every dump in the captures (docs/PROTOCOL.md). */
+/*
+ * The panel assumed until the device reports one: 48 kHz, internal clock,
+ * S/PDIF output and SOFT CTRL on, as every dump in the captures shows, but
+ * OUTPUT VOLUME on MAIN, the factory setting (Owner's Manual, p. 44).
+ */
 void ua1000_panel_init(struct ua1000_panel *panel);
 
 /* Patch bay: a source for each stereo pair of three routing tables. */

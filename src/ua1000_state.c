@@ -1,6 +1,31 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * ua1000_state.c - what the editor knows about the device, and how to change it
+ *
+ * This module owns struct ua1000_state, the editor's copy of the device's
+ * settings: panel switches, the three patch-bay tables, both MONITOR mixers,
+ * MONITOR OUT and what this editor stored in the five memory slots.  It
+ * provides:
+ *
+ *  - the edits (ua1000_edit_*()), which change the state and return the
+ *    SysEx messages that make the device follow, the linked partner
+ *    included;
+ *  - ua1000_state_sync(), every message that brings the device to the state;
+ *  - the reading of the device's current-state block, and the adoption of
+ *    it as the editor's state;
+ *  - a description of the differences between two states, in words;
+ *  - the state file's text format (writing and parsing) and the names it
+ *    shares with the command line.
+ *
+ * Invariants kept on the state: every value is within the device's range
+ * (an edit that would break one is refused with the state untouched); a
+ * linked pair moves together; an unlinked pair has at most one channel
+ * soloed, because the device's solo register holds one channel per pair.
+ *
+ * It does no I/O on the device and knows no file path: the messages are sent
+ * by the caller (ua1000_midi.c), and the state file is placed, read and
+ * replaced by ua1000_statefile.c.  Its users are ua1000ctl.c, the GUI
+ * (src/gui/) and ua1000_statefile.c.
  */
 #include "ua1000_state.h"
 
@@ -11,11 +36,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* The state file's first line: the magic word and the format version. */
 #define STATE_MAGIC "ua1000-state"
 #define STATE_VERSION 1
 
 /* ---- Names ---- */
 
+/* One entry of a name table: the spelling used in files and on the command
+ * line, and the enum value it stands for. */
 struct name {
 	const char *text;
 	int value;
@@ -55,6 +83,10 @@ static const struct name table_names[] = {
 
 #define COUNT(a) (sizeof(a) / sizeof((a)[0]))
 
+/*
+ * The name of value in the table names[0..n), or NULL when the table has
+ * none.  The *_name() functions below are thin typed wrappers over it.
+ */
 static const char *name_of(const struct name *names, size_t n, int value)
 {
 	for (size_t i = 0; i < n; i++)
@@ -63,6 +95,11 @@ static const char *name_of(const struct name *names, size_t n, int value)
 	return NULL;
 }
 
+/*
+ * Look text up in names[0..n), case-sensitively.  On a match store its value
+ * in *value and return true; otherwise return false with *value untouched.
+ * Used by the *_parse() functions below.
+ */
 static bool value_of(const struct name *names, size_t n, const char *text,
 		     int *value)
 {
@@ -75,11 +112,13 @@ static bool value_of(const struct name *names, size_t n, const char *text,
 	return false;
 }
 
+/* The state file's name for a patch-bay source, or NULL if it has none. */
 const char *ua1000_source_name(enum ua1000_source source)
 {
 	return name_of(source_names, COUNT(source_names), (int)source);
 }
 
+/* A patch-bay source from its name. */
 bool ua1000_source_parse(const char *name, enum ua1000_source *source)
 {
 	int value;
@@ -90,11 +129,13 @@ bool ua1000_source_parse(const char *name, enum ua1000_source *source)
 	return true;
 }
 
+/* The state file's name for a clock source, or NULL if it has none. */
 const char *ua1000_clock_name(enum ua1000_clock clock)
 {
 	return name_of(clock_names, COUNT(clock_names), (int)clock);
 }
 
+/* A clock source from its name. */
 bool ua1000_clock_parse(const char *name, enum ua1000_clock *clock)
 {
 	int value;
@@ -105,11 +146,13 @@ bool ua1000_clock_parse(const char *name, enum ua1000_clock *clock)
 	return true;
 }
 
+/* The state file's name for a mixer, or NULL if it has none. */
 const char *ua1000_mixer_name(enum ua1000_mixer mixer)
 {
 	return name_of(mixer_names, COUNT(mixer_names), (int)mixer);
 }
 
+/* A mixer from its name. */
 bool ua1000_mixer_parse(const char *name, enum ua1000_mixer *mixer)
 {
 	int value;
@@ -120,11 +163,13 @@ bool ua1000_mixer_parse(const char *name, enum ua1000_mixer *mixer)
 	return true;
 }
 
+/* The state file's name for a patch-bay table, or NULL if it has none. */
 const char *ua1000_route_table_name(enum ua1000_route_table table)
 {
 	return name_of(table_names, COUNT(table_names), (int)table);
 }
 
+/* A patch-bay table from its name. */
 bool ua1000_route_table_parse(const char *name, enum ua1000_route_table *table)
 {
 	int value;
@@ -164,6 +209,7 @@ static void mixer_init(struct ua1000_mixer_state *mixer)
 		mixer->link[pair] = false;
 }
 
+/* Fill *state with the editor's defaults. */
 void ua1000_state_init(struct ua1000_state *state)
 {
 	memset(state, 0, sizeof(*state));
@@ -185,6 +231,7 @@ void ua1000_state_init(struct ua1000_state *state)
 	state->monitor_link = true;
 }
 
+/* The defaults, keeping the memories and the running sample rate. */
 void ua1000_state_reset(struct ua1000_state *state)
 {
 	struct ua1000_state fresh;
@@ -197,28 +244,36 @@ void ua1000_state_reset(struct ua1000_state *state)
 
 /* ---- Edits ---- */
 
+/* Whether mixer and channel (0-based) name a strip of the device. */
 static bool channel_valid(enum ua1000_mixer mixer, unsigned int channel)
 {
 	return ua1000_mixer_valid(mixer) && channel < UA1000_CHANNELS;
 }
 
+/* The other channel of channel's pair: 0 <-> 1, 2 <-> 3, ... */
 static unsigned int partner(unsigned int channel)
 {
 	return channel ^ 1u;
 }
 
+/* Whether channel's pair is linked in mixer. */
 static bool linked(const struct ua1000_state *state, enum ua1000_mixer mixer,
 		   unsigned int channel)
 {
 	return state->mixer[mixer].link[channel / 2];
 }
 
+/*
+ * The common refusal of an edit: no message, -EINVAL.  Callers return it
+ * before touching the state, as the edit contract requires.
+ */
 static int refuse(struct ua1000_edit *edit)
 {
 	edit->count = 0;
 	return -EINVAL;
 }
 
+/* Set a strip's gain, and its partner's when the pair is linked. */
 int ua1000_edit_gain(struct ua1000_state *state, struct ua1000_edit *edit,
 		     enum ua1000_mixer mixer, unsigned int channel,
 		     uint32_t gain)
@@ -239,6 +294,7 @@ int ua1000_edit_gain(struct ua1000_state *state, struct ua1000_edit *edit,
 	return 0;
 }
 
+/* Set a strip's pan; a linked partner gets the mirrored position. */
 int ua1000_edit_pan(struct ua1000_state *state, struct ua1000_edit *edit,
 		    enum ua1000_mixer mixer, unsigned int channel, uint16_t pan)
 {
@@ -260,6 +316,7 @@ int ua1000_edit_pan(struct ua1000_state *state, struct ua1000_edit *edit,
 	return 0;
 }
 
+/* Mute or unmute a strip, and its partner when the pair is linked. */
 int ua1000_edit_mute(struct ua1000_state *state, struct ua1000_edit *edit,
 		     enum ua1000_mixer mixer, unsigned int channel, bool mute)
 {
@@ -314,6 +371,10 @@ static void one_solo_per_pair(struct ua1000_mixer_state *mixers, size_t n)
 	}
 }
 
+/*
+ * Solo a strip or take its solo off.  One message always: the pair's solo
+ * register, written whole (solo_mask()).
+ */
 int ua1000_edit_solo(struct ua1000_state *state, struct ua1000_edit *edit,
 		     enum ua1000_mixer mixer, unsigned int channel, bool solo)
 {
@@ -335,6 +396,7 @@ int ua1000_edit_solo(struct ua1000_state *state, struct ua1000_edit *edit,
 	return 0;
 }
 
+/* Link or unlink a pair: the link message, then the pair's solo register. */
 int ua1000_edit_link(struct ua1000_state *state, struct ua1000_edit *edit,
 		     enum ua1000_mixer mixer, unsigned int pair, bool link)
 {
@@ -363,6 +425,7 @@ int ua1000_edit_link(struct ua1000_state *state, struct ua1000_edit *edit,
 	return 0;
 }
 
+/* Set a MONITOR OUT side's gain, and the other side's when linked. */
 int ua1000_edit_monitor_gain(struct ua1000_state *state,
 			     struct ua1000_edit *edit, enum ua1000_side side,
 			     uint32_t gain)
@@ -385,6 +448,10 @@ int ua1000_edit_monitor_gain(struct ua1000_state *state,
 	return 0;
 }
 
+/*
+ * Link or unlink MONITOR OUT's sides.  Linking does not equalise their gains:
+ * the next ua1000_edit_monitor_gain() does.
+ */
 int ua1000_edit_monitor_link(struct ua1000_state *state,
 			     struct ua1000_edit *edit, bool link)
 {
@@ -393,6 +460,7 @@ int ua1000_edit_monitor_link(struct ua1000_state *state,
 	return ua1000_build_monitor_link(&edit->msg[0], link);
 }
 
+/* Write the panel switches as one block. */
 int ua1000_edit_panel(struct ua1000_state *state, struct ua1000_edit *edit,
 		      const struct ua1000_panel *panel)
 {
@@ -419,6 +487,7 @@ int ua1000_edit_panel(struct ua1000_state *state, struct ua1000_edit *edit,
 	return 0;
 }
 
+/* Route source to one pair of a patch-bay table. */
 int ua1000_edit_route(struct ua1000_state *state, struct ua1000_edit *edit,
 		      enum ua1000_route_table table, unsigned int pair,
 		      enum ua1000_source source)
@@ -430,6 +499,11 @@ int ua1000_edit_route(struct ua1000_state *state, struct ua1000_edit *edit,
 	return 0;
 }
 
+/*
+ * Apply a patch-bay preset to WAVE IN and/or OUTPUT (KEEP leaves a table as
+ * it is).  The state takes the tables the preset leaves on the device, as
+ * ua1000_apply_*_preset() model them.
+ */
 int ua1000_edit_preset(struct ua1000_state *state, struct ua1000_edit *edit,
 		       enum ua1000_wave_in_preset wave_in,
 		       enum ua1000_output_preset output)
@@ -442,6 +516,7 @@ int ua1000_edit_preset(struct ua1000_state *state, struct ua1000_edit *edit,
 	return 0;
 }
 
+/* Store the selected sections into a memory slot (1..5). */
 int ua1000_edit_store(struct ua1000_state *state, struct ua1000_edit *edit,
 		      unsigned int slot, unsigned int sections)
 {
@@ -451,7 +526,9 @@ int ua1000_edit_store(struct ua1000_state *state, struct ua1000_edit *edit,
 
 	struct ua1000_memory *memory = &state->memory[slot - 1];
 
-	/* A partial store leaves the slot's mixer as it was. */
+	/* MONITOR is the mixer section (docs/PROTOCOL.md, Memory): a store
+	 * without it leaves the slot's mixer, and what is known of it, as it
+	 * was. */
 	if (sections & UA1000_SECTION_MONITOR) {
 		memory->known = true;
 		memcpy(memory->mixer, state->mixer, sizeof(memory->mixer));
@@ -463,6 +540,7 @@ int ua1000_edit_store(struct ua1000_state *state, struct ua1000_edit *edit,
 	return 0;
 }
 
+/* Load the selected sections of a memory slot (1..5). */
 int ua1000_edit_load(struct ua1000_state *state, struct ua1000_edit *edit,
 		     unsigned int slot, unsigned int sections,
 		     bool *mixer_known)
@@ -473,6 +551,8 @@ int ua1000_edit_load(struct ua1000_state *state, struct ua1000_edit *edit,
 
 	const struct ua1000_memory *memory = &state->memory[slot - 1];
 
+	/* Without the MONITOR section the device keeps its mixer, so the
+	 * state still describes it. */
 	*mixer_known = true;
 	if (sections & UA1000_SECTION_MONITOR) {
 		*mixer_known = memory->known;
@@ -480,6 +560,8 @@ int ua1000_edit_load(struct ua1000_state *state, struct ua1000_edit *edit,
 		if (memory->known) {
 			memcpy(state->mixer, memory->mixer,
 			       sizeof(state->mixer));
+			/* a slot written by an older editor may hold
+			 * two solos in an unlinked pair */
 			one_solo_per_pair(state->mixer, COUNT(state->mixer));
 			memcpy(state->monitor_gain, memory->monitor_gain,
 			       sizeof(state->monitor_gain));
@@ -505,6 +587,10 @@ int ua1000_edit_load(struct ua1000_state *state, struct ua1000_edit *edit,
 #define BLOCK_PAN_NIBBLES 4
 #define BLOCK_GAIN_NIBBLES 6
 
+/*
+ * Flag i of a bit field that packs four flags a byte, in bits 0-3, starting
+ * at data[base] (the links and the mutes of the block).
+ */
 static bool block_bit(const uint8_t *data, unsigned int base, unsigned int i)
 {
 	return data[base + i / 4] & (1u << (i % 4));
@@ -523,6 +609,7 @@ static bool block_nibbles(const uint8_t *data, unsigned int at,
 	return true;
 }
 
+/* Decode the device's current-state block (UA1000_BLOCK_CURRENT). */
 int ua1000_state_from_block(struct ua1000_state *state,
 			    const struct ua1000_dt1 *dt1)
 {
@@ -531,11 +618,15 @@ int ua1000_state_from_block(struct ua1000_state *state,
 	struct ua1000_event event = { 0 };
 	struct ua1000_state st;
 
+	/* Address 02 00 00 00, the whole block, and the header the device
+	 * answers a request with. */
 	if (dt1->addr[0] != 0x02 || dt1->addr[1] != UA1000_BLOCK_CURRENT ||
 	    dt1->addr[2] != 0x00 || dt1->addr[3] != 0x00 ||
 	    dt1->len != UA1000_GLOBAL_BLOCK_SIZE ||
 	    memcmp(data, header, sizeof(header)) != 0)
 		return -EBADMSG;
+	/* Decoded into a fresh state, so that *state is untouched when the
+	 * block is refused. */
 	ua1000_state_init(&st);
 	/* panel, WAVE IN and DM ON: as the device's own dumps */
 	event.panel = st.panel;
@@ -545,6 +636,7 @@ int ua1000_state_from_block(struct ua1000_state *state,
 		return -EBADMSG;
 	st.panel = event.panel;
 	st.patchbay = event.patchbay;
+	/* DM OFF is in the block only, not in the dumps. */
 	for (unsigned int pair = 0; pair < UA1000_PAIRS; pair++) {
 		uint8_t source = data[BLOCK_DM_OFF + pair];
 
@@ -553,6 +645,7 @@ int ua1000_state_from_block(struct ua1000_state *state,
 		st.patchbay.route[UA1000_ROUTE_OUTPUT_DM_OFF][pair] = source;
 	}
 	st.monitor_link = data[BLOCK_MONITOR_LINK] != 0;
+	/* Both mixers have the same layout, the output's after the input's. */
 	for (unsigned int m = 0; m < 2; m++) {
 		struct ua1000_mixer_state *mixer = &st.mixer[m];
 
@@ -576,7 +669,9 @@ int ua1000_state_from_block(struct ua1000_state *state,
 			s->mute = block_bit(data, BLOCK_MUTES + 3 * m, ch);
 			s->pan = (uint16_t)pan;
 			s->gain = gain;
-			s->solo = false; /* not decoded */
+			/* not decoded: bytes 22-23 hold only the last solo
+			 * written to each mixer, not one per pair */
+			s->solo = false;
 		}
 	}
 	for (unsigned int side = 0; side < 2; side++) {
@@ -594,6 +689,10 @@ int ua1000_state_from_block(struct ua1000_state *state,
 	return 0;
 }
 
+/*
+ * Take what a dump from the device reports.  A GLOBAL dump carries the panel
+ * and the WAVE IN and DM ON tables only, so DM OFF and the mixers are kept.
+ */
 void ua1000_state_apply_event(struct ua1000_state *state,
 			      const struct ua1000_event *event)
 {
@@ -615,6 +714,7 @@ void ua1000_state_apply_event(struct ua1000_state *state,
 	}
 }
 
+/* Every message that brings the device to *state. */
 void ua1000_state_sync(const struct ua1000_state *state,
 		       struct ua1000_sync *sync)
 {
@@ -656,7 +756,12 @@ void ua1000_state_sync(const struct ua1000_state *state,
 				  state->monitor_gain[UA1000_RIGHT]);
 }
 
-/* Whether two states write the same state file. */
+/*
+ * Whether two states write the same state file: a comparison of everything
+ * the file holds, without listing the fields twice.  A state that cannot be
+ * written to memory counts as different.  Used by
+ * ua1000_state_adopt_device().
+ */
 static bool same_text(const struct ua1000_state *a,
 		      const struct ua1000_state *b)
 {
@@ -680,6 +785,7 @@ static bool same_text(const struct ua1000_state *a,
 	return same;
 }
 
+/* Make the device's state the editor's, keeping solos, memories and rate. */
 bool ua1000_state_adopt_device(struct ua1000_state *state,
 			       const struct ua1000_state *device,
 			       struct ua1000_sync *solos)
@@ -688,15 +794,16 @@ bool ua1000_state_adopt_device(struct ua1000_state *state,
 	bool differed;
 
 	memcpy(next.memory, state->memory, sizeof(next.memory));
-	/* the running rate is the driver's (the caller's): the block's rate
-	 * byte is not a rate code at a fixed SAMPLE RATE position (measured:
-	 * 00 at 44.1 kHz) */
+	/* the running rate is the driver's (the caller's): the block's byte 4
+	 * holds the position of the SAMPLE RATE switch, not a rate code
+	 * (docs/PROTOCOL.md, Reading the device) */
 	next.panel.rate = state->panel.rate;
 	for (unsigned int m = 0; m < 2; m++)
 		for (unsigned int ch = 0; ch < UA1000_CHANNELS; ch++)
 			next.mixer[m].strip[ch].solo =
 				state->mixer[m].strip[ch].solo;
-	/* a linked pair solos together: as the device reads the pair now */
+	/* the links are the device's now: one solo per unlinked pair under
+	 * them, as the device reads the pair */
 	one_solo_per_pair(next.mixer, COUNT(next.mixer));
 	next.mixer_unknown = false;
 	{
@@ -715,6 +822,8 @@ bool ua1000_state_adopt_device(struct ua1000_state *state,
 		differed = !same_text(&a, &next);
 	}
 	*state = next;
+	/* The block does not say which channels are soloed: the editor's
+	 * solos are written over whatever the device holds. */
 	solos->count = 0;
 	for (int m = UA1000_MIXER_INPUT; m <= UA1000_MIXER_OUTPUT; m++)
 		for (unsigned int pair = 0; pair < UA1000_PAIRS; pair++)
@@ -727,11 +836,17 @@ bool ua1000_state_adopt_device(struct ua1000_state *state,
 
 /* ---- Describing a change ---- */
 
+/* The output buffer of ua1000_state_describe_changes() as it fills. */
 struct changes {
 	char *out;
 	size_t len, used, count, max_lines;
 };
 
+/*
+ * Count one change and, while fewer than max_lines have been written and
+ * the buffer has room, append its line.  Truncates silently; the buffer
+ * stays NUL-terminated.
+ */
 static void change(struct changes *c, const char *fmt, ...)
 {
 	va_list ap;
@@ -749,6 +864,11 @@ static void change(struct changes *c, const char *fmt, ...)
 		c->used = c->len - 1;
 }
 
+/*
+ * A gain in dB with one decimal, as the changes show it: "-inf" for silence,
+ * and no "-0.0".  Two gains are reported as different only when this text
+ * differs.
+ */
 static void db_text(uint32_t gain, char *buf, size_t len)
 {
 	double db = ua1000_gain_to_db(gain);
@@ -759,6 +879,7 @@ static void db_text(uint32_t gain, char *buf, size_t len)
 		snprintf(buf, len, "%.1f", fabs(db) < 0.05 ? 0.0 : db);
 }
 
+/* A pan position as the panel shows it: "C", "L<n>" or "R<n>". */
 static void pan_text(uint16_t raw, char *buf, size_t len)
 {
 	int p = ua1000_pan_to_position(raw);
@@ -769,6 +890,7 @@ static void pan_text(uint16_t raw, char *buf, size_t len)
 		snprintf(buf, len, "%c%d", p < 0 ? 'L' : 'R', abs(p));
 }
 
+/* The clock source as the device's CLOCK SOURCE switch labels it. */
 static const char *clock_label(enum ua1000_clock clock)
 {
 	return clock == UA1000_CLOCK_EXT_SPDIF	? "S/PDIF"
@@ -776,6 +898,7 @@ static const char *clock_label(enum ua1000_clock clock)
 						: "INT";
 }
 
+/* Report an on/off setting when it changed. */
 static void describe_flag(struct changes *c, const char *what, bool from,
 			  bool to)
 {
@@ -784,6 +907,7 @@ static void describe_flag(struct changes *c, const char *what, bool from,
 		       to ? "on" : "off");
 }
 
+/* The differences from *from to *to, one line each, in the panel's words. */
 size_t ua1000_state_describe_changes(const struct ua1000_state *from,
 				     const struct ua1000_state *to, char *out,
 				     size_t len, size_t max_lines)
@@ -859,6 +983,7 @@ size_t ua1000_state_describe_changes(const struct ua1000_state *from,
 	}
 	describe_flag(&c, "MONITOR OUT link", from->monitor_link,
 		      to->monitor_link);
+	/* Only when there is room left: the lines already written stand. */
 	if (c.count > max_lines && c.used + 1 < len)
 		snprintf(out + c.used, len - c.used, "and %zu more\n",
 			 c.count - max_lines);
@@ -867,11 +992,17 @@ size_t ua1000_state_describe_changes(const struct ua1000_state *from,
 
 /* ---- State file ---- */
 
+/* A boolean as the state file spells it. */
 static const char *on_off(bool value)
 {
 	return value ? "on" : "off";
 }
 
+/*
+ * Write both mixers and MONITOR OUT, each line led by prefix: "" for the
+ * live state, "memory N " for a memory slot, so that both are read back by
+ * the same parse_mixer_line().
+ */
 static void write_mixer(FILE *f, const char *prefix,
 			const struct ua1000_mixer_state mixer[2],
 			const uint32_t monitor_gain[2], bool monitor_link)
@@ -896,6 +1027,10 @@ static void write_mixer(FILE *f, const char *prefix,
 		on_off(monitor_link));
 }
 
+/*
+ * Write the state file: header, panel, routes, the mixers, the mixer_unknown
+ * mark, then each memory this editor stored, its lines prefixed "memory N".
+ */
 int ua1000_state_write(const struct ua1000_state *state, FILE *f)
 {
 	const struct ua1000_panel *p = &state->panel;
@@ -942,6 +1077,10 @@ struct line {
 	size_t err_len;
 };
 
+/*
+ * Record why the line is refused in l->err and return false, so that a
+ * parser can "return fail(...)".  ua1000_state_read() adds the line number.
+ */
 static bool fail(struct line *l, const char *fmt, ...)
 {
 	va_list ap;
@@ -952,11 +1091,13 @@ static bool fail(struct line *l, const char *fmt, ...)
 	return false;
 }
 
+/* The next word of the line, or NULL at its end. */
 static const char *word(struct line *l)
 {
 	return l->next < l->count ? l->word[l->next++] : NULL;
 }
 
+/* Consume the next word, which must be keyword. */
 static bool expect(struct line *l, const char *keyword)
 {
 	const char *w = word(l);
@@ -966,6 +1107,11 @@ static bool expect(struct line *l, const char *keyword)
 	return true;
 }
 
+/*
+ * Consume a decimal number in min..max.  A minus sign and trailing
+ * characters are refused.  On failure *value is still written, possibly out
+ * of range: callers must not use it.
+ */
 static bool number(struct line *l, unsigned long min, unsigned long max,
 		   unsigned long *value)
 {
@@ -987,6 +1133,7 @@ static bool number(struct line *l, unsigned long min, unsigned long max,
 	return true;
 }
 
+/* Consume one of two words: on gives true, off false. */
 static bool boolean(struct line *l, const char *on, const char *off,
 		    bool *value)
 {
@@ -1002,11 +1149,16 @@ static bool boolean(struct line *l, const char *on, const char *off,
 	return true;
 }
 
+/* Consume "on" or "off". */
 static bool flag(struct line *l, bool *value)
 {
 	return boolean(l, "on", "off", value);
 }
 
+/*
+ * Consume a mixer name.  *mixer is always left a valid index, so that a
+ * caller cannot index with garbage even on failure.
+ */
 static bool mixer_word(struct line *l, enum ua1000_mixer *mixer)
 {
 	const char *w = word(l);
@@ -1017,6 +1169,10 @@ static bool mixer_word(struct line *l, enum ua1000_mixer *mixer)
 	return true;
 }
 
+/*
+ * "strip MIXER CH gain G pan P mute on|off solo on|off": one strip, written
+ * only when the whole line is valid.  Channels are 1-based in the file.
+ */
 static bool parse_strip(struct line *l, struct ua1000_mixer_state mixer[2])
 {
 	enum ua1000_mixer m;
@@ -1035,6 +1191,7 @@ static bool parse_strip(struct line *l, struct ua1000_mixer_state mixer[2])
 	return true;
 }
 
+/* "link MIXER PAIR on|off", pairs 1-based. */
 static bool parse_link(struct line *l, struct ua1000_mixer_state mixer[2])
 {
 	enum ua1000_mixer m;
@@ -1044,6 +1201,7 @@ static bool parse_link(struct line *l, struct ua1000_mixer_state mixer[2])
 	       flag(l, &mixer[m].link[pair - 1]);
 }
 
+/* "monitor gain-left G gain-right G link on|off". */
 static bool parse_monitor(struct line *l, uint32_t gain[2], bool *link)
 {
 	unsigned long left, right;
@@ -1058,6 +1216,11 @@ static bool parse_monitor(struct line *l, uint32_t gain[2], bool *link)
 	return true;
 }
 
+/*
+ * The mixer settings, key already consumed: shared by the live state and
+ * the "memory N" lines, which give their own mixer and monitor to fill.
+ * An unknown key fails here, so the whole file refuses unknown settings.
+ */
 static bool parse_mixer_line(struct line *l, const char *key,
 			     struct ua1000_mixer_state mixer[2],
 			     uint32_t monitor_gain[2], bool *monitor_link)
@@ -1071,6 +1234,10 @@ static bool parse_mixer_line(struct line *l, const char *key,
 	return fail(l, "unknown setting \"%s\"", key);
 }
 
+/*
+ * "route TABLE PAIR SOURCE": the source must be one the table accepts
+ * ("same" is DM OFF's only).
+ */
 static bool parse_route(struct line *l, struct ua1000_patchbay *patchbay)
 {
 	const char *w = word(l);
@@ -1091,6 +1258,12 @@ static bool parse_route(struct line *l, struct ua1000_patchbay *patchbay)
 	return true;
 }
 
+/*
+ * One line after the header, its words already split: the panel settings
+ * are handled here, the rest by parse_route() and parse_mixer_line().
+ * Called by ua1000_state_read(), which checks afterwards that every word
+ * was consumed.
+ */
 static bool parse_setting(struct line *l, struct ua1000_state *state)
 {
 	struct ua1000_panel *p = &state->panel;
@@ -1138,6 +1311,8 @@ static bool parse_setting(struct line *l, struct ua1000_state *state)
 
 		if (!sub)
 			return fail(l, "missing setting");
+		/* The first line of a slot starts it from the defaults, so a
+		 * slot is known however few of its lines the file holds. */
 		if (!mem->known) {
 			mem->known = true;
 			mixer_init(&mem->mixer[0]);
@@ -1153,6 +1328,7 @@ static bool parse_setting(struct line *l, struct ua1000_state *state)
 				&state->monitor_link);
 }
 
+/* Parse a state file into *state, from the defaults. */
 int ua1000_state_read(struct ua1000_state *state, FILE *f, char *err,
 		      size_t err_len)
 {
@@ -1185,6 +1361,7 @@ int ua1000_state_read(struct ua1000_state *state, FILE *f, char *err,
 		}
 		bool ok = true;
 
+		/* Split into words; a line starting with '#' is a comment. */
 		for (char *w = strtok_r(buf, " \t\r\n", &save); w;
 		     w = strtok_r(NULL, " \t\r\n", &save)) {
 			if (l.count == COUNT(l.word)) {
@@ -1215,6 +1392,9 @@ int ua1000_state_read(struct ua1000_state *state, FILE *f, char *err,
 		if (ok && l.next != l.count)
 			ok = fail(&l, "unexpected \"%s\"", l.word[l.next]);
 		if (!ok) {
+			/* err is both the reason and the result: copied
+			 * first, as snprintf() may not read and write the same
+			 * buffer. */
 			char reason[128];
 
 			snprintf(reason, sizeof(reason), "%s", err);
@@ -1227,6 +1407,8 @@ int ua1000_state_read(struct ua1000_state *state, FILE *f, char *err,
 		snprintf(err, err_len, "no \"%s\" header", STATE_MAGIC);
 		return -EINVAL;
 	}
+	/* a file written by an older editor, or by hand, may hold two
+	 * solos in an unlinked pair */
 	one_solo_per_pair(state->mixer, COUNT(state->mixer));
 	return ferror(f) ? -EIO : 0;
 }

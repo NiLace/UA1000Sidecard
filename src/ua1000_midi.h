@@ -1,6 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * ua1000_midi.h - the UA-1000's MIDI port, through ALSA rawmidi
+ *
+ * Finding the device's control port, opening it, and moving the messages of
+ * ua1000_proto.h to and from it.  No call blocks on a device that takes no
+ * bytes for longer than UA1000_MIDI_WRITE_TIMEOUT_MS at a time.
  */
 #ifndef UA1000_MIDI_H
 #define UA1000_MIDI_H
@@ -74,8 +78,10 @@ int ua1000_midi_poll_descriptors(struct ua1000_midi *midi, struct pollfd *fds,
 
 /*
  * Read what the device has sent, without blocking, and call handler for each
- * well-formed DT1 message.  Returns 0, or a negative errno when the port has
- * failed (the device was unplugged, for instance).
+ * well-formed DT1 message.  The message, dt1->data included, lives in the
+ * handle's buffer: it is valid only during the handler's call.  Returns 0,
+ * or a negative errno when the port has failed (the device was unplugged,
+ * for instance).
  */
 typedef void ua1000_midi_handler(const struct ua1000_dt1 *dt1, void *data);
 

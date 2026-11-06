@@ -148,12 +148,12 @@ After a load that includes the panel or the patch bay, the device reports
 them, and the state follows.
 .TP
 .BI user\-set " rate"
-Store the power-on settings: everything as it is now (panel switches, patch
-bay, mixers), at
+Store the power-on settings: the panel switches, at
 .I rate
 Hz (44100, 48000, 88200 or 96000).
-With the SAMPLE RATE switch on USER SET, the device powers up in exactly
-that state.
+Read back from the device, the USER SET also holds the patch bay and both
+mixers as they were when it was stored, and with the SAMPLE RATE switch on
+USER SET the device powers up in exactly that state.
 .SH EXIT STATUS
 0 on success, 1 when the device or the state file fails (also when another
 program, such as a connected

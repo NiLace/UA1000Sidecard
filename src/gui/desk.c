@@ -12,6 +12,24 @@
  *
  * Every position comes from desk.layout, written by gui/scene/make_assets.sh
  * from the render's own projection; nothing is measured off an image.
+ *
+ * Data: one struct desk per window (app->desk): the parsed layout, the
+ * images, the controls placed over them and the meters' state, all in the
+ * panel's 1x pixels.  The panel is one GtkFixed of that size, scaled to the
+ * window as a whole (scaler_new()), so nothing else here depends on the
+ * window's size.
+ *
+ * Invariants: desk_new() refuses a layout without every fader, knob, cap,
+ * button and the rate display, so the code that places and paints them
+ * never checks for one missing; meters and the status zone are optional.
+ * The controls hold no settings: the paint reads the widgets' values, and
+ * the desk's own gestures (fader caps, knobs, the rate display) only set
+ * those values or call the toolbar's and dialogs' functions.
+ *
+ * It does not talk to the device or edit the state directly; meter levels
+ * come from meters.c, through JACK.  Used by app.c (desk_new(),
+ * desk_refresh(), desk_detach(), desk_free(), desk_natural_size()) and
+ * toolbar.c (desk_redraw()).
  */
 #include "app.h"
 #include "meters.h"
@@ -22,15 +40,20 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Room for desk.layout's buttons; has_all_buttons() lists those required. */
 #define DESK_MAX_BUTTONS 64
+/* Cells of the rate display. */
 #define DESK_MAX_DIGITS 4
 
+/* The fader cap images: input mixer, output mixer, monitor. */
 enum desk_group { GROUP_IN, GROUP_OUT, GROUP_MON, GROUP_COUNT };
 
+/* A rectangle in the panel's 1x pixels: top-left, bottom-right. */
 struct desk_box {
 	double x0, y0, x1, y1;
 };
 
+/* A fader cap: one image per group, placed by its index line. */
 struct desk_cap {
 	double w, h, ax, ay; /* size and the index line's centre in it */
 	cairo_surface_t *image;
@@ -42,12 +65,17 @@ struct desk_fader {
 	double xb, yb, xt, yt;
 };
 
+/* A pan knob on the panel: its centre and outer radius. */
 struct desk_knob {
 	bool found;
 	double cx, cy, r;
 	GtkWidget *hit; /* takes drags, scrolls and keys for the pan scale */
 };
 
+/*
+ * A button's box, by its desk.layout id, and the control placed over it
+ * (NULL until place_button() or place_device() runs).
+ */
 struct desk_button {
 	char id[24];
 	struct desk_box box;
@@ -65,12 +93,18 @@ struct desk_meter {
 	bool available;
 };
 
+/* The meters' scale runs from METER_FLOOR_DB to 0 dBFS. */
 #define METER_FLOOR_DB (-60.0)
 #define METER_FALL_DB_S 12.0 /* a peak programme meter's fall, about */
 #define METER_HOLD_US G_GINT64_CONSTANT(1500000)
 #define METER_CLIP_US G_GINT64_CONSTANT(2000000)
 #define METER_PERIOD_MS 33
 
+/*
+ * The seven-segment rate display: a digit's size (dw, dh), the segments'
+ * thickness t and slant (skew), their lit colour, the decimal point, and
+ * the n cells' positions.
+ */
 struct desk_digits {
 	bool found;
 	double dw, dh, t, skew;
@@ -80,6 +114,10 @@ struct desk_digits {
 	double x[DESK_MAX_DIGITS], y[DESK_MAX_DIGITS]; /* bottom-left corners */
 };
 
+/*
+ * One window's desk: the layout and images, the controls placed over them
+ * and the meters' state.  All coordinates are the panel's 1x pixels.
+ */
 struct desk {
 	struct app *app;
 	double width, height;
@@ -111,6 +149,11 @@ struct desk {
 
 /* ---- Loading ---- */
 
+/*
+ * Parse "<prefix>N", N = 1..UA1000_CHANNELS, at the start of id: *channel
+ * gets N - 1 and *rest points past the number.  False when id does not
+ * start that way.
+ */
 static bool parse_channel(const char *id, const char *prefix,
 			  unsigned int *channel, const char **rest)
 {
@@ -128,6 +171,8 @@ static bool parse_channel(const char *id, const char *prefix,
 	return true;
 }
 
+/* "RRGGBB" (six hex digits, no '#') as cairo's 0..1 components; false and
+ * rgb untouched on anything else. */
 static bool hex_rgb(const char *hex, double rgb[3])
 {
 	char *end;
@@ -159,8 +204,14 @@ static bool numbers(char *const *tok, size_t count, double *out)
 	return true;
 }
 
+/* The longest line: a digits line with DESK_MAX_DIGITS cells. */
 #define DESK_MAX_TOKENS (12 + 2 * DESK_MAX_DIGITS)
 
+/*
+ * Split line in place on blanks into tok[]: the number of tokens, or
+ * DESK_MAX_TOKENS + 1 for a line with more than tok holds (no line
+ * kind accepts that count, so the line is refused).
+ */
 static size_t split(char *line, char **tok)
 {
 	char *save = NULL;
@@ -175,7 +226,13 @@ static size_t split(char *line, char **tok)
 	return n;
 }
 
-/* digits ID DW DH T SKEW SEG OFF DPX DPY DPR N X Y ... */
+/*
+ * digits ID DW DH T SKEW SEG OFF DPX DPY DPR N X Y ...
+ *
+ * A digit's size, the segments' thickness and slant, the lit colour, the
+ * decimal point (centre, radius) and N cells' bottom-left corners; ID and
+ * OFF are not read.  The token count must agree with N.
+ */
 static bool parse_digits(struct desk *d, char **tok, size_t n)
 {
 	struct desk_digits *g = &d->digits;
@@ -200,6 +257,7 @@ static bool parse_digits(struct desk *d, char **tok, size_t n)
 	return true;
 }
 
+/* A fader by its id: "in.N", "out.N", "mon.1" or "mon.2"; else NULL. */
 static struct desk_fader *fader_of(struct desk *d, const char *id)
 {
 	unsigned int ch;
@@ -229,6 +287,7 @@ static struct desk_meter *meter_of(struct desk *d, const char *id)
 	return NULL;
 }
 
+/* A pan knob by its id, "in.N.pan" or "out.N.pan"; else NULL. */
 static struct desk_knob *knob_of(struct desk *d, const char *id)
 {
 	unsigned int ch;
@@ -241,6 +300,12 @@ static struct desk_knob *knob_of(struct desk *d, const char *id)
 	return NULL;
 }
 
+/*
+ * One desk.layout line into d.  A blank line is accepted.  False refuses
+ * the whole layout: an unknown kind, a wrong token count, a bad number, an
+ * id that names nothing, or a button past DESK_MAX_BUTTONS.  Only zones
+ * of an unknown name are let pass.
+ */
 static bool parse_line(struct desk *d, char *line)
 {
 	static const char *const groups[] = { "in", "out", "mon" };
@@ -318,6 +383,7 @@ static bool parse_line(struct desk *d, char *line)
 	return false;
 }
 
+/* The button with this id, or NULL. */
 static struct desk_button *button_box(struct desk *d, const char *id)
 {
 	for (size_t i = 0; i < d->n_buttons; i++)
@@ -360,6 +426,13 @@ static bool has_all_buttons(struct desk *d)
 	return true;
 }
 
+/*
+ * Read desk.layout into d.  True only when every line parses and the
+ * size, the rate display, every strip's fader and knob, both monitor
+ * faders, the caps' sizes and every button are present: the placing and
+ * painting code relies on that and checks none of them.  Meters and the
+ * status zone are optional.
+ */
 static bool load_layout(struct desk *d, const char *path)
 {
 	FILE *f = fopen(path, "r");
@@ -383,6 +456,7 @@ static bool load_layout(struct desk *d, const char *path)
 	return d->monitor[0].found && d->monitor[1].found && has_all_buttons(d);
 }
 
+/* dir/name through app_load_image(); NULL when missing or unreadable. */
 static cairo_surface_t *load_image(const char *dir, const char *name,
 				   double scale)
 {
@@ -393,6 +467,11 @@ static cairo_surface_t *load_image(const char *dir, const char *name,
 	return s;
 }
 
+/*
+ * The plate, the all-lit render and the three caps, from dir/2x or else
+ * dir/1x.  False when any is missing; what was loaded stays in d for
+ * desk_free().
+ */
 static bool load_images(struct desk *d, const char *dir)
 {
 	static const char *const caps[] = { "cap_in.png", "cap_out.png",
@@ -400,7 +479,8 @@ static bool load_images(struct desk *d, const char *dir)
 	char sub[4096];
 	double scale = 2.0;
 
-	/* The 2x set looks right on every screen; the 1x set is the fallback. */
+	/* The 2x set looks right on every screen; the 1x set is the
+	 * fallback. */
 	snprintf(sub, sizeof(sub), "%s/2x", dir);
 	if (!g_file_test(sub, G_FILE_TEST_IS_DIR)) {
 		snprintf(sub, sizeof(sub), "%s/1x", dir);
@@ -420,6 +500,7 @@ static bool load_images(struct desk *d, const char *dir)
 
 /* ---- Painting ---- */
 
+/* The cap image of a strip's mixer. */
 static enum desk_group group_of(enum ua1000_mixer m)
 {
 	return m == UA1000_MIXER_INPUT ? GROUP_IN : GROUP_OUT;
@@ -435,6 +516,11 @@ static void fader_point(const struct desk_fader *f, double value, double *x,
 	*y = f->yb + (f->yt - f->yb) * frac;
 }
 
+/*
+ * A fader's cap at its scale's value, on whole pixels, and the amber focus
+ * ring round the cap while the scale has visible focus (paint_focus()
+ * leaves scales to this function: their widget spans the whole travel).
+ */
 static void paint_cap(cairo_t *cr, const struct desk_cap *cap,
 		      const struct desk_fader *f, GtkWidget *scale)
 {
@@ -454,7 +540,8 @@ static void paint_cap(cairo_t *cr, const struct desk_cap *cap,
 }
 
 /* The knob's index: a line on the cap, 0.10..0.92 of its radius, in the
- * render's colour. */
+ * render's colour.  It turns from -135 degrees (hard left) through the top
+ * (centre) to +135 degrees (hard right). */
 static void paint_pointer(cairo_t *cr, const struct desk *d,
 			  const struct desk_knob *k, GtkWidget *pan)
 {
@@ -474,7 +561,12 @@ static void paint_pointer(cairo_t *cr, const struct desk *d,
 	cairo_stroke(cr);
 }
 
-/* desk_scene.py's seven_seg(): a bar from p to q with pointed ends. */
+/*
+ * desk_scene.py's seven_seg(): a bar from (ax, az) to (bx, bz) with pointed
+ * ends, in the cell's own coordinates (z up), slanted by the skew.  It is
+ * horizontal when az == bz, else vertical with a below b.  The path is
+ * added to cr, for paint_digit() to fill.
+ */
 static void seg_bar(cairo_t *cr, const struct desk_digits *g, double x0,
 		    double y0, double ax, double az, double bx, double bz)
 {
@@ -510,6 +602,10 @@ static void seg_bar(cairo_t *cr, const struct desk_digits *g, double x0,
 	cairo_close_path(cr);
 }
 
+/*
+ * The segments lit for c: a top, b and c right, d bottom, e and f left,
+ * g middle.  '-' lights g; any other character, none.
+ */
 static const char *segments_of(char c)
 {
 	static const char *const digit[] = { "abcdef", "bc",   "abged",
@@ -522,6 +618,8 @@ static const char *segments_of(char c)
 	return c == '-' ? "g" : "";
 }
 
+/* Fill c's segments in the cell whose bottom-left corner is (x0, y0), in
+ * the source colour the caller set. */
 static void paint_digit(cairo_t *cr, const struct desk_digits *g, double x0,
 			double y0, char c)
 {
@@ -558,6 +656,11 @@ static void paint_digit(cairo_t *cr, const struct desk_digits *g, double x0,
 	cairo_fill(cr);
 }
 
+/*
+ * The rate display: the state's rate as three digits and the decimal
+ * point, or "---" without the point for a rate ua1000_rate_hz() does not
+ * know.  Characters past the layout's cells are not drawn.
+ */
 static void paint_rate(cairo_t *cr, const struct desk *d)
 {
 	const struct desk_digits *g = &d->digits;
@@ -580,6 +683,8 @@ static void paint_rate(cairo_t *cr, const struct desk *d)
 	}
 }
 
+/* The amber ring round the focused control, in the coordinates of the
+ * desk's fixed; nothing for a focus outside the desk. */
 static void paint_focus(cairo_t *cr, GtkWidget *focus, GtkWidget *fixed)
 {
 	graphene_rect_t r;
@@ -636,6 +741,13 @@ static void paint_status(cairo_t *cr, const struct desk *d)
 	g_free(text);
 }
 
+/*
+ * The draw function of the desk's top drawing area (and of
+ * desk_shot_paint(), with a NULL area): the plate, then each lit control's
+ * box copied from the all-lit render, the knob pointers and fader caps, the
+ * rate, the status and the focus ring, each over the ones before.  The
+ * drawing area is as large as the panel, so width and height are not used.
+ */
 static void paint(GtkDrawingArea *area, cairo_t *cr, int width, int height,
 		  gpointer data)
 {
@@ -683,18 +795,21 @@ static void paint(GtkDrawingArea *area, cairo_t *cr, int width, int height,
 			    gtk_widget_get_parent(d->paint));
 }
 
+/* Queue a repaint of the desk; nothing once desk_detach() has run. */
 static void redraw(struct desk *d)
 {
 	if (d->paint)
 		gtk_widget_queue_draw(d->paint);
 }
 
+/* "value-changed" of a scale, "toggled" of a toggle: repaint the desk. */
 static void on_changed(GObject *object, gpointer data)
 {
 	(void)object;
 	redraw(data);
 }
 
+/* A "notify::" signal, whose handler takes the GParamSpec: repaint. */
 static void on_notify(GObject *object, GParamSpec *pspec, gpointer data)
 {
 	(void)object;
@@ -702,6 +817,8 @@ static void on_notify(GObject *object, GParamSpec *pspec, gpointer data)
 	redraw(data);
 }
 
+/* "state-flags-changed" of a push button: repaint, as it is lit while
+ * held down (button_lit()). */
 static void on_state_changed(GtkWidget *w, GtkStateFlags previous,
 			     gpointer data)
 {
@@ -712,12 +829,19 @@ static void on_state_changed(GtkWidget *w, GtkStateFlags previous,
 
 /* ---- Controls ---- */
 
+/*
+ * A control that keeps its size and input but draws nothing (the
+ * desk-control class of load_desk_css()); mixer.c's "small" class, which
+ * sets a font size, is dropped.
+ */
 static void make_transparent(GtkWidget *w)
 {
 	gtk_widget_add_css_class(w, "desk-control");
 	gtk_widget_remove_css_class(w, "small");
 }
 
+/* Put w on the desk's fixed at (x, y), sized width x height, in the
+ * panel's pixels rounded to whole ones. */
 static void place(GtkWidget *fixed, GtkWidget *w, double x, double y,
 		  double width, double height)
 {
@@ -739,6 +863,12 @@ struct cap_drag {
 	bool held;
 };
 
+/*
+ * "drag-begin" of a desk fader's gesture, run in the capture phase, before
+ * the scale sees the press.  The press holds the cap when it falls within
+ * the cap's rows; y is in the scale's coordinates, whose top is cd->top on
+ * the panel.  The width is not checked: the scale is as wide as the cap.
+ */
 static void on_cap_drag_begin(GtkGestureDrag *g, double x, double y,
 			      gpointer data)
 {
@@ -758,6 +888,11 @@ static void on_cap_drag_begin(GtkGestureDrag *g, double x, double y,
 		gtk_widget_grab_focus(scale);
 }
 
+/*
+ * "drag-update": a held cap moves with the pointer's vertical offset,
+ * scaled so that the travel in pixels spans the fader's whole range.  The
+ * value is rounded to a whole fader position.
+ */
 static void on_cap_drag_update(GtkGestureDrag *g, double dx, double dy,
 			       gpointer data)
 {
@@ -773,6 +908,12 @@ static void on_cap_drag_update(GtkGestureDrag *g, double dx, double dy,
 			    round(cd->start - dy * UA1000_FADER_MAX / travel));
 }
 
+/*
+ * Lay mixer.c's fader scale over its travel on the panel: one cap wide,
+ * from the cap's top at full scale to its bottom at zero, with a cap_drag
+ * gesture in front of GTK's own.  The scale's value-changed repaints the
+ * desk, which draws the cap.
+ */
 static void place_fader(struct desk *d, GtkWidget *fixed, GtkWidget *scale,
 			const struct desk_fader *f, const struct desk_cap *cap)
 {
@@ -803,17 +944,20 @@ static void place_fader(struct desk *d, GtkWidget *fixed, GtkWidget *scale,
 /* Page Up/Down: a quarter of one side's travel. */
 #define PAN_PAGE (UA1000_PAN_STEPS / 4.0)
 
+/* Move a pan scale by steps; GtkRange keeps it within its range. */
 static void pan_step(GtkWidget *pan, double steps)
 {
 	gtk_range_set_value(GTK_RANGE(pan),
 			    gtk_range_get_value(GTK_RANGE(pan)) + steps);
 }
 
+/* A knob drag: the pan scale it turns, and its value at the press. */
 struct knob_drag {
 	GtkWidget *pan;
 	double start;
 };
 
+/* "drag-begin" on a knob: the drag counts from the value at the press. */
 static void on_knob_drag_begin(GtkGestureDrag *g, double x, double y,
 			       gpointer data)
 {
@@ -825,7 +969,8 @@ static void on_knob_drag_begin(GtkGestureDrag *g, double x, double y,
 	k->start = gtk_range_get_value(GTK_RANGE(k->pan));
 }
 
-/* Up or right turns clockwise: a step per 4 pixels. */
+/* "drag-update" on a knob: up or right turns clockwise, a step per 4
+ * pixels, counted from the press so the knob does not jump. */
 static void on_knob_drag_update(GtkGestureDrag *g, double dx, double dy,
 				gpointer data)
 {
@@ -836,6 +981,7 @@ static void on_knob_drag_update(GtkGestureDrag *g, double dx, double dy,
 			    round(k->start + (dx - dy) / 4.0));
 }
 
+/* "scroll" on a knob: one step per event, up turning clockwise. */
 static gboolean on_knob_scroll(GtkEventControllerScroll *c, double dx,
 			       double dy, gpointer data)
 {
@@ -845,6 +991,11 @@ static gboolean on_knob_scroll(GtkEventControllerScroll *c, double dx,
 	return TRUE;
 }
 
+/*
+ * "key-pressed" on a focused knob: arrows move a step, Page Up/Down
+ * PAN_PAGE, Home centres.  Other keys are left to GTK (Tab moves the
+ * focus on).
+ */
 static gboolean on_knob_key(GtkEventControllerKey *c, guint key, guint code,
 			    GdkModifierType mods, gpointer data)
 {
@@ -875,7 +1026,11 @@ static gboolean on_knob_key(GtkEventControllerKey *c, guint key, guint code,
 	}
 }
 
-/* A double click centres the pan, as on most desks' software panels. */
+/*
+ * "pressed" on a knob: a double click centres the pan, as on most desks'
+ * software panels, and claims the sequence.  A single press is left to the
+ * drag gesture.
+ */
 static void on_knob_pressed(GtkGestureClick *g, int n, double x, double y,
 			    gpointer data)
 {
@@ -901,11 +1056,19 @@ static void knob_value_to_accessible(GtkWidget *hit, GtkWidget *pan)
 	g_free(text);
 }
 
+/* "value-changed" of a pan scale: its knob's accessible value follows. */
 static void on_knob_value(GtkRange *pan, gpointer hit)
 {
 	knob_value_to_accessible(hit, GTK_WIDGET(pan));
 }
 
+/*
+ * Stand a focusable drawing area (the hit) over a pan knob.  mixer.c's pan
+ * scale is not placed: the hit keeps a reference to it and its drags,
+ * clicks, scrolls and keys set its value, so the scale's own handler still
+ * edits the state.  The scale's value-changed repaints the desk (the
+ * pointer is painted) and updates the hit's accessible value.
+ */
 static void place_knob(struct desk *d, GtkWidget *fixed, struct desk_knob *k,
 		       GtkWidget *pan)
 {
@@ -955,7 +1118,11 @@ static void place_knob(struct desk *d, GtkWidget *fixed, struct desk_knob *k,
 	place(fixed, hit, k->cx - k->r, k->cy - k->r, 2 * k->r, 2 * k->r);
 }
 
-/* Put a control over its button's box (has_all_buttons() checked it). */
+/*
+ * Put a control over its button's box (has_all_buttons() checked it).  Its
+ * child is removed: the render draws the legend.  A toggle repaints the
+ * desk when toggled, a push button when its state flags change.
+ */
 static void place_button(struct desk *d, GtkWidget *fixed, const char *id,
 			 GtkWidget *w)
 {
@@ -973,6 +1140,10 @@ static void place_button(struct desk *d, GtkWidget *fixed, const char *id,
 				 G_CALLBACK(on_state_changed), d);
 }
 
+/*
+ * "toggled" of the three clock buttons, one radio group: the one turned
+ * on sets the clock.  Ignored while app_refresh() sets the buttons.
+ */
 static void on_clock_button(GtkToggleButton *b, gpointer data)
 {
 	struct app *app = data;
@@ -984,6 +1155,11 @@ static void on_clock_button(GtkToggleButton *b, gpointer data)
 			toolbar_set_clock(app, (enum ua1000_clock)i);
 }
 
+/*
+ * "toggled" of the digital output pair (a radio group) and of the MONO,
+ * SOFT CTRL and OUTPUT ALL switches: the panel settings with this one
+ * changed go through toolbar_edit_panel().  Ignored while refreshing.
+ */
 static void on_panel_button(GtkToggleButton *b, gpointer data)
 {
 	struct app *app = data;
@@ -1008,6 +1184,10 @@ static void on_panel_button(GtkToggleButton *b, gpointer data)
 	toolbar_edit_panel(app, &panel);
 }
 
+/*
+ * A desk toggle: its tooltip is also its accessible label, it joins
+ * group's radio group when group is not NULL, and handler gets app.
+ */
 static GtkWidget *toggle(struct app *app, const char *tooltip,
 			 GCallback handler, GtkWidget *group)
 {
@@ -1023,6 +1203,8 @@ static GtkWidget *toggle(struct app *app, const char *tooltip,
 	return b;
 }
 
+/* A push button for an application action (toolbar.c installs them),
+ * labelled by its tooltip. */
 static GtkWidget *action_button(const char *tooltip, const char *action)
 {
 	GtkWidget *b = gtk_button_new();
@@ -1056,10 +1238,15 @@ static void place_device(struct desk *d, GtkWidget *fixed)
 	place(fixed, mb, b->box.x0, b->box.y0, b->box.x1 - b->box.x0,
 	      b->box.y1 - b->box.y0);
 	/* a notify handler takes the GParamSpec too: on_changed() does not,
-	 * and connected here it crashed the GUI on the first click */
+	 * and connected here it would take the GParamSpec for the desk */
 	g_signal_connect(mb, "notify::active", G_CALLBACK(on_notify), d);
 }
 
+/*
+ * The master section, made here (the plain layout has the toolbar's
+ * instead): clock, digital output, MONO, SOFT CTRL, OUTPUT ALL, the
+ * memory, patch bay and notes buttons, and DEVICE.
+ */
 static void place_master(struct desk *d, GtkWidget *fixed)
 {
 	struct app *app = d->app;
@@ -1100,6 +1287,8 @@ static void place_master(struct desk *d, GtkWidget *fixed)
 
 /* ---- The rate display: a click offers the rates for the USER SET ---- */
 
+/* "clicked" of a rate in the rate popover: close it and store that rate
+ * in the device's USER SET. */
 static void on_rate_chosen(GtkButton *button, gpointer data)
 {
 	struct app *app = data;
@@ -1113,6 +1302,7 @@ static void on_rate_chosen(GtkButton *button, gpointer data)
 	app_store_user_set(app, hz);
 }
 
+/* "clicked" of the rate display: open its popover. */
 static void on_rate_clicked(GtkButton *button, gpointer data)
 {
 	GtkWidget *popover = data;
@@ -1121,6 +1311,11 @@ static void on_rate_clicked(GtkButton *button, gpointer data)
 	gtk_popover_popup(GTK_POPOVER(popover));
 }
 
+/*
+ * A transparent button over the rate display: the digit cells, the last
+ * one's slant included, and a 6-pixel margin.  It opens a popover of the
+ * four rates; desk_redraw() makes it sensitive only while connected.
+ */
 static void place_rate(struct desk *d, GtkWidget *fixed)
 {
 	static const unsigned int rates[] = { 44100, 48000, 88200, 96000 };
@@ -1160,6 +1355,11 @@ static void place_rate(struct desk *d, GtkWidget *fixed)
 	place(fixed, button, x0 - 6, y0 - 6, x1 - x0 + 12, y1 - y0 + 12);
 }
 
+/*
+ * Place every control on the panel: both mixers' strips and links (the
+ * widgets mixer_create() made), the monitor faders and link, the master
+ * section and the rate display.
+ */
 static void place_controls(struct desk *d, GtkWidget *fixed)
 {
 	struct app *app = d->app;
@@ -1194,6 +1394,11 @@ static void place_controls(struct desk *d, GtkWidget *fixed)
 	place_rate(d, fixed);
 }
 
+/*
+ * The desk's CSS, for the whole display: the desk-control class, and the
+ * window's background in the render's backdrop colour.  Its priority is
+ * one above app.c's, whose window.desk-mode rule it overrides.
+ */
 static void load_desk_css(const struct desk *d)
 {
 	/* The controls keep their size and input, and draw nothing. */
@@ -1240,6 +1445,8 @@ static void load_desk_css(const struct desk *d)
  * the device.  A MEASURED post-fader level, taken before the front panel's
  * volume knob (read off the diagram, and checked on the device: the knob does
  * not move it, the faders and mute do).
+ *
+ * False: the strip has no source (an input no WAVE IN pair takes).
  */
 #define MAIN_CAPTURE_CHANNEL 10 /* 0-based: MAIN L; MAIN R is 11 */
 
@@ -1270,6 +1477,12 @@ static bool meter_source(const struct app *app, int mixer, unsigned int ch,
 	return false;
 }
 
+/*
+ * One tick of a meter, dt seconds after the last: take the peak since then
+ * (none when not routed), let the bar fall at METER_FALL_DB_S, hold a new
+ * peak for METER_HOLD_US, light the clip lamp for METER_CLIP_US at full
+ * scale.  The well is repainted only when what it shows has changed.
+ */
 static void meter_update(struct desk_meter *mt, struct meters *meters,
 			 bool routed, enum meter_source_kind kind,
 			 unsigned int channel, gint64 now, double dt)
@@ -1301,6 +1514,10 @@ static void meter_update(struct desk_meter *mt, struct meters *meters,
 
 static void show_meters_live(struct desk *d, bool live);
 
+/*
+ * The meters' timeout, every METER_PERIOD_MS.  Each tick asks
+ * meter_source() again, so a change of routing shows at once.
+ */
 static gboolean on_meter_tick(gpointer data)
 {
 	struct desk *d = data;
@@ -1342,6 +1559,8 @@ static gboolean on_meter_tick(gpointer data)
 	return G_SOURCE_CONTINUE;
 }
 
+/* A level as a fraction of the well's height: 0 at METER_FLOOR_DB, 1 at
+ * 0 dBFS, clamped. */
 static double meter_frac(double db)
 {
 	return fmin(fmax((db - METER_FLOOR_DB) / -METER_FLOOR_DB, 0.0), 1.0);
@@ -1392,7 +1611,8 @@ static void paint_meter(GtkDrawingArea *area, cairo_t *cr, int width,
 	}
 }
 
-/* Why a meter well stays dark: the meters read the audio from a sound server */
+/* Why a meter well stays dark: the meters read the audio from a sound
+ * server. */
 #define METER_OFF_TIP                                                          \
 	"No meters: they read the audio through a JACK client. Start "         \
 	"PipeWire (with pipewire-jack) or JACK on the UA-1000: the meters "    \
@@ -1407,6 +1627,7 @@ static void show_meter_live(struct desk_meter *mt, bool live)
 	gtk_widget_set_tooltip_text(mt->area, live ? NULL : METER_OFF_TIP);
 }
 
+/* Every well live or dark, when that changes. */
 static void show_meters_live(struct desk *d, bool live)
 {
 	if (live == d->meters_shown_live)
@@ -1419,6 +1640,11 @@ static void show_meters_live(struct desk *d, bool live)
 		show_meter_live(&d->monitor_meter[side], live);
 }
 
+/*
+ * The meter's drawing area over its well, when the layout has one.  The
+ * areas are placed after the panel's drawing area, so they are on top of
+ * it.
+ */
 static void place_meter(GtkWidget *fixed, struct desk_meter *mt, bool live)
 {
 	if (!mt->found)
@@ -1432,6 +1658,7 @@ static void place_meter(GtkWidget *fixed, struct desk_meter *mt, bool live)
 	      mt->box.y1 - mt->box.y0);
 }
 
+/* Open the meters, place every well and start the tick. */
 static void start_meters(struct desk *d, GtkWidget *fixed)
 {
 	d->meters = meters_open();
@@ -1448,9 +1675,9 @@ static void start_meters(struct desk *d, GtkWidget *fixed)
 /*
  * The main window is being destroyed, and the desk's widgets with it: stop
  * the meter tick and forget them now.  desk_free() runs later, at the
- * application's shutdown, and a tick due in between drew on finalised
- * widgets (reproduced: a Gtk-CRITICAL per meter per tick; a crash once the
- * memory is reused).
+ * application's shutdown, and a tick due in between would draw on
+ * finalised widgets: a Gtk-CRITICAL per meter per tick, and a crash once
+ * the memory is reused.
  */
 void desk_detach(struct app *app)
 {
@@ -1468,6 +1695,7 @@ void desk_detach(struct app *app)
 	d->rate = NULL;
 }
 
+/* Free the desk: the tick, the meters' JACK client and the images. */
 void desk_free(struct app *app)
 {
 	struct desk *d = app->desk;
@@ -1500,6 +1728,8 @@ struct scaler {
 	GtkWidget *outer, *inner;
 };
 
+/* "resize" of the sizer: the panel scaled to fit, its proportions kept,
+ * and centred. */
 static void on_scaler_resize(GtkDrawingArea *area, int width, int height,
 			     gpointer data)
 {
@@ -1517,6 +1747,11 @@ static void on_scaler_resize(GtkDrawingArea *area, int width, int height,
 	gsk_transform_unref(t);
 }
 
+/*
+ * An overlay: under it, an expanding drawing area that draws nothing and
+ * reports the space the window gives; over it, a GtkFixed holding the
+ * panel (inner) under the transform that on_scaler_resize() sets.
+ */
 static GtkWidget *scaler_new(struct desk *d, GtkWidget *inner)
 {
 	struct scaler *sc = g_new0(struct scaler, 1);
@@ -1560,6 +1795,7 @@ static void backdrop_of(struct desk *d)
 	d->backdrop[2] = (double)(v & 0xff) / 255.0;
 }
 
+/* Build the desk from the assets in dir; NULL, nothing kept, if they fail. */
 GtkWidget *desk_new(struct app *app, const char *dir)
 {
 	struct desk *d = g_new0(struct desk, 1);
@@ -1567,12 +1803,15 @@ GtkWidget *desk_new(struct app *app, const char *dir)
 	GtkWidget *fixed;
 
 	d->app = app;
+	/* one layout for both image sets: its coordinates are the 1x pixels */
 	snprintf(path, sizeof(path), "%s/1x/desk.layout", dir);
 	if (!load_layout(d, path) || !load_images(d, dir)) {
 		app->desk = d;
 		desk_free(app);
 		return NULL;
 	}
+	/* the controls are made only now: on failure the caller's plain
+	 * layout makes them itself (mixer_new()) */
 	app->desk = d;
 	backdrop_of(d);
 	load_desk_css(d);
@@ -1581,12 +1820,15 @@ GtkWidget *desk_new(struct app *app, const char *dir)
 	gtk_widget_set_size_request(fixed, (int)lround(d->width),
 				    (int)lround(d->height));
 	place_controls(d, fixed);
+	/* the panel's drawing area goes over the controls and takes no input:
+	 * every event reaches the transparent controls under it */
 	d->paint = gtk_drawing_area_new();
 	gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(d->paint), paint, d,
 				       NULL);
 	gtk_widget_set_can_target(d->paint, FALSE);
 	place(fixed, d->paint, 0, 0, d->width, d->height);
 	start_meters(d, fixed);
+	/* the focus ring is painted by the desk: repaint when it moves */
 	if (app->window) {
 		g_signal_connect_object(app->window, "notify::focus-widget",
 					G_CALLBACK(gtk_widget_queue_draw),
@@ -1598,6 +1840,7 @@ GtkWidget *desk_new(struct app *app, const char *dir)
 	return scaler_new(d, fixed);
 }
 
+/* The panel's size in desk.layout's 1x pixels. */
 void desk_natural_size(const struct app *app, int *width, int *height)
 {
 	*width = (int)lround(app->desk->width);
@@ -1605,6 +1848,7 @@ void desk_natural_size(const struct app *app, int *width, int *height)
 }
 
 
+/* Repaint the desk, and offer the rate display only while connected. */
 void desk_redraw(struct app *app)
 {
 	if (!app->desk)
@@ -1616,6 +1860,7 @@ void desk_redraw(struct app *app)
 	redraw(app->desk);
 }
 
+/* Show the state's panel settings on the master section's buttons. */
 void desk_refresh(struct app *app)
 {
 	struct desk *d = app->desk;
@@ -1623,6 +1868,8 @@ void desk_refresh(struct app *app)
 
 	if (!d)
 		return;
+	/* app_refresh() calls this with app->refreshing set: the toggled
+	 * handlers return without editing the state */
 	gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d->clock[p->clock]),
 				     TRUE);
 	gtk_toggle_button_set_active(
