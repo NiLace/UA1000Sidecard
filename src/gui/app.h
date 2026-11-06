@@ -35,6 +35,10 @@ struct notes_widgets {
 	GtkTextBuffer *buffer;
 	guint save_source;
 	bool dirty; /* changed since the last save */
+	/* A notes file that was not UTF-8: its bytes, kept to be written to
+	 * "notes.orig" before the first save replaces it; NULL otherwise. */
+	gchar *original;
+	gsize original_len;
 };
 
 struct app {
@@ -52,6 +56,11 @@ struct app {
 	const char *port_option; /* -p, or NULL to find the device */
 	struct ua1000_midi *midi; /* the control port; NULL: not connected */
 	guint midi_source; /* the watch on its input, or 0 */
+	/* Inside ua1000_midi_receive(): a disconnect then waits for the read
+	 * loop to return (disconnect_pending, with its error). */
+	bool receiving;
+	bool disconnect_pending;
+	int disconnect_err;
 	/* On connecting, the device was asked for its state: the answer is
 	 * awaited until this timeout (then the saved state is sent instead). */
 	guint read_source;
@@ -128,6 +137,7 @@ void app_schedule_save(struct app *app);
 void app_send(struct app *app, const struct ua1000_msg *msg, size_t count);
 /* Take the state the device reported (its answer to a block request): the
  * panel shows it, saves it, and gives the device the panel's solos. */
+
 void app_adopt_device_state(struct app *app, const struct ua1000_state *device);
 
 /* After a memory load: read the device once its own dump has come, so the

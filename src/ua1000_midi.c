@@ -224,7 +224,7 @@ struct rate {
 	bool found;
 };
 
-/* Card visitor: parse the first UA-1000's long name, and stop there. */
+/* Card visitor: the rate of the first UA-1000 whose long name parses. */
 static bool rate_visitor(const struct card *card, void *data)
 {
 	struct rate *r = data;
@@ -232,7 +232,7 @@ static bool rate_visitor(const struct card *card, void *data)
 	if (!card->is_ua1000)
 		return false;
 	r->found = ua1000_midi_rate_from_longname(card->longname, &r->hz);
-	return true;
+	return r->found; /* a name that does not parse: try the next unit */
 }
 
 /*
@@ -482,13 +482,20 @@ int ua1000_midi_send(struct ua1000_midi *midi, const struct ua1000_msg *msg,
 int ua1000_midi_drain(struct ua1000_midi *midi)
 {
 	const struct timespec step = { 0, 10000000L }; /* 10 ms */
+	struct timespec start, now;
 
-	for (int waited = 0;; waited += 10) {
+	/* the time that passed, not the sleeps counted: a call between them
+	 * takes its own */
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	for (;;) {
 		int pending = output_pending(midi->out);
 
 		if (pending <= 0)
 			return pending;
-		if (waited >= UA1000_MIDI_WRITE_TIMEOUT_MS) {
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		if ((now.tv_sec - start.tv_sec) * 1000 +
+			    (now.tv_nsec - start.tv_nsec) / 1000000 >=
+		    UA1000_MIDI_WRITE_TIMEOUT_MS) {
 			snd_rawmidi_drop(midi->out);
 			return -ETIMEDOUT;
 		}
@@ -537,6 +544,10 @@ int ua1000_midi_receive(struct ua1000_midi *midi, ua1000_midi_handler *handler,
 	}
 }
 
+/* A macro's value as a string literal (for the messages below). */
+#define STRINGIFY_(x) #x
+#define STRINGIFY(x) STRINGIFY_(x)
+
 /*
  * A cause worth naming for the errors these functions return on their own,
  * and ALSA's description for the rest.
@@ -551,9 +562,14 @@ const char *ua1000_midi_strerror(int err)
 		       "the cable 1 fix (a driver patched to cable 1 alone "
 		       "can be named with --port)";
 	case -ETIMEDOUT:
-		return "the UA-1000 stopped taking messages (no room freed in "
-		       "1 s); it may be busy switching its clock, or have "
-		       "lost its clock source";
+		return "the UA-1000 stopped taking messages (no room freed "
+		       "in " STRINGIFY(
+			       UA1000_MIDI_WRITE_TIMEOUT_MS) " ms); it may be "
+							     "busy switching "
+							     "its clock, or "
+							     "have lost its "
+							     "clock "
+							     "source";
 	case -EBUSY:
 		return "the MIDI port is in use by another program "
 		       "(is ua1000gui connected?)";

@@ -34,6 +34,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 
 #define VERSION "0.2"
 
@@ -699,6 +700,8 @@ static void on_device_message(const struct ua1000_dt1 *dt1, void *data)
  * whatever arrives within DUMP_WAIT_MS.
  */
 #define DUMP_WAIT_MS 1000
+/* The longest a dump is listened to, however much keeps arriving. */
+#define DUMP_LIMIT_MS 3000
 
 /*
  * Apply whatever the device sends until it has been quiet for DUMP_WAIT_MS.
@@ -709,12 +712,21 @@ static int read_dump(struct ctl *ctl, struct ua1000_midi *midi)
 {
 	struct pollfd fds[4];
 	int n = ua1000_midi_poll_descriptors(midi, fds, 4);
+	struct timespec start, now;
 
+	/* a device that never stops sending is listened to DUMP_LIMIT_MS at
+	 * most */
+	clock_gettime(CLOCK_MONOTONIC, &start);
 	while (n > 0 && poll(fds, (nfds_t)n, DUMP_WAIT_MS) > 0) {
 		int err = ua1000_midi_receive(midi, on_device_message, ctl);
 
 		if (err != 0)
 			return err;
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		if ((now.tv_sec - start.tv_sec) * 1000 +
+			    (now.tv_nsec - start.tv_nsec) / 1000000 >=
+		    DUMP_LIMIT_MS)
+			break;
 	}
 	return 0;
 }
@@ -851,6 +863,7 @@ static int cmd_read(const char *port, bool dry_run)
 	char found[32];
 	int n, err;
 
+	wait.got = false;
 	ua1000_build_block_request(&request, UA1000_BLOCK_CURRENT);
 	if (dry_run) {
 		for (size_t j = 0; j < request.len; j++)
@@ -958,10 +971,15 @@ int main(int argc, char **argv)
 
 	const char *name = argv[i];
 
-	/* listing the ports needs no state file */
+	/* listing the ports and reading the device need no state file */
 	if (strcmp(name, "ports") == 0) {
 		ua1000_midi_list(stdout);
 		return 0;
+	}
+	if (strcmp(name, "read") == 0) {
+		if (argc - i != 1)
+			return bad("read takes no arguments");
+		return cmd_read(port, dry_run);
 	}
 
 	if (!state_path) {
@@ -983,11 +1001,6 @@ int main(int argc, char **argv)
 		return EXIT_RUNTIME;
 	}
 
-	if (strcmp(name, "read") == 0) {
-		if (argc - i != 1)
-			return bad("read takes no arguments");
-		return cmd_read(port, dry_run);
-	}
 	if (strcmp(name, "status") == 0) {
 		if (!existed)
 			fputs("# no state saved yet: these are the defaults\n",

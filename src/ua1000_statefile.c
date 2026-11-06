@@ -106,8 +106,8 @@ static int make_parents(const char *path)
 }
 
 /*
- * Make a rename in path's directory durable by syncing the directory.  A
- * path with no '/' (the current directory) is not synced, and 0 returned.
+ * Make a rename in path's directory durable by syncing the directory (the
+ * current one for a path with no '/').
  * Returns 0 or a negative errno.  Called last by ua1000_statefile_save().
  */
 static int sync_parent(const char *path)
@@ -117,10 +117,12 @@ static int sync_parent(const char *path)
 	char *slash = strrchr(dir, '/');
 	int fd, ret = 0;
 
-	if (n < 0 || (size_t)n >= sizeof(dir) || !slash)
+	if (n < 0 || (size_t)n >= sizeof(dir))
 		return 0;
-	/* keep the '/' itself when the directory is the root */
-	*(slash == dir ? slash + 1 : slash) = '\0';
+	if (!slash)
+		snprintf(dir, sizeof(dir), "."); /* a bare file name: here */
+	else /* keep the '/' itself when the directory is the root */
+		*(slash == dir ? slash + 1 : slash) = '\0';
 	fd = open(dir, O_RDONLY | O_DIRECTORY);
 	if (fd < 0)
 		return -errno;

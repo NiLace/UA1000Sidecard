@@ -210,6 +210,16 @@ bool app_connected(const struct app *app)
  */
 static void disconnect(struct app *app, int err)
 {
+	/* Inside ua1000_midi_receive() (a handler that sent, and the send
+	 * failed) the handle must outlive the read loop that is using it:
+	 * the disconnect is done by on_midi_input() once the loop returns. */
+	if (app->receiving) {
+		if (!app->disconnect_pending) {
+			app->disconnect_pending = true;
+			app->disconnect_err = err;
+		}
+		return;
+	}
 	g_clear_handle_id(&app->read_source, g_source_remove);
 	g_clear_handle_id(&app->reread_source, g_source_remove);
 	if (app->midi_source) {
@@ -234,7 +244,7 @@ void app_send(struct app *app, const struct ua1000_msg *msg, size_t count)
 {
 	int err;
 
-	if (!app->midi || count == 0)
+	if (!app->midi || count == 0 || app->disconnect_pending)
 		return;
 	err = ua1000_midi_send(app->midi, msg, count);
 	if (err != 0)
@@ -419,6 +429,31 @@ static void on_device_message(const struct ua1000_dt1 *dt1, void *data)
 }
 
 /*
+ * The end of a receive: a disconnect that a handler asked for while the read
+ * loop was running is done now, or err (the read's own) disconnects.  Returns
+ * whether the input source stays (G_SOURCE_CONTINUE) or goes.
+ */
+static gboolean end_receive(struct app *app, int err)
+{
+	app->receiving = false;
+	if (app->disconnect_pending) {
+		app->disconnect_pending = false;
+		err = app->disconnect_err ? app->disconnect_err : err;
+		if (err == 0) {
+			app->midi_source = 0; /* returning REMOVE removes it */
+			disconnect(app, 0);
+			return G_SOURCE_REMOVE;
+		}
+	}
+	if (err != 0) {
+		app->midi_source = 0;
+		disconnect(app, err);
+		return G_SOURCE_REMOVE;
+	}
+	return G_SOURCE_CONTINUE;
+}
+
+/*
  * g_unix_fd_add() callback for the control port's input: handle every
  * message waiting.  An error, or a hang-up of the descriptor (the device
  * unplugged), disconnects; midi_source is cleared first because returning
@@ -435,14 +470,11 @@ static gboolean on_midi_input(gint fd, GIOCondition condition, gpointer data)
 		disconnect(app, -ENODEV);
 		return G_SOURCE_REMOVE;
 	}
+	app->receiving = true;
 	err = ua1000_midi_receive(app->midi, on_device_message, app);
-	if (err != 0) {
-		app->midi_source = 0;
-		disconnect(app, err);
-		return G_SOURCE_REMOVE;
-	}
-	return G_SOURCE_CONTINUE;
+	return end_receive(app, err);
 }
+
 
 /* (Re)open the control port and start reading the device's state. */
 void app_connect(struct app *app)
@@ -717,8 +749,8 @@ static void load_css(void)
 		"color: white; }\n"
 		".channel-name { font-weight: bold; }\n"
 		".small { font-size: smaller; }\n"
-		"window.desk-mode, window.desk-mode > box { background: "
-		"#101215; color: #e7e5ef; }\n"
+		/* the desk's background is desk.c's: its render's backdrop */
+		"window.desk-mode, window.desk-mode > box { color: #e7e5ef; }\n"
 		/* a notice: a card in the desk's colours (PALETTE.md) */
 		"window.notice-card { background: #16191d; color: #e7e5ef; "
 		"border: 1px solid #3d58a3; border-radius: 8px; }\n"

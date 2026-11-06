@@ -175,7 +175,8 @@ device, but the panel says it cannot show what it holds; DEVICE > Reconnect read
 A notepad for what is wired where: what each input, output and digital port of this UA-1000 is connected to,
 which is easy to forget and hard to check without unracking it. It is an ordinary text editor: select, copy,
 paste, undo and scroll as in any other. It saves itself a moment after each change and when its window closes, in
-`~/.local/state/ua1000/notes` (beside the state file).
+`~/.local/state/ua1000/notes` (beside the state file). A notes file written elsewhere in another encoding than
+UTF-8 is shown read as Latin-1, and the first save keeps the file exactly as it was in `notes.orig`.
 
 ## PATCH BAY
 

@@ -455,9 +455,11 @@ int ua1000_edit_monitor_gain(struct ua1000_state *state,
 int ua1000_edit_monitor_link(struct ua1000_state *state,
 			     struct ua1000_edit *edit, bool link)
 {
+	if (ua1000_build_monitor_link(&edit->msg[0], link) != 0)
+		return refuse(edit);
 	state->monitor_link = link;
 	edit->count = 1;
-	return ua1000_build_monitor_link(&edit->msg[0], link);
+	return 0;
 }
 
 /* Write the panel switches as one block. */
@@ -865,18 +867,46 @@ static void change(struct changes *c, const char *fmt, ...)
 }
 
 /*
- * A gain in dB with one decimal, as the changes show it: "-inf" for silence,
- * and no "-0.0".  Two gains are reported as different only when this text
- * differs.
+ * A gain in dB with the given decimals, as the changes show it: "-inf" for
+ * silence, and no "-0.0".
  */
-static void db_text(uint32_t gain, char *buf, size_t len)
+static void db_text(uint32_t gain, int decimals, char *buf, size_t len)
 {
 	double db = ua1000_gain_to_db(gain);
 
-	if (isinf(db))
+	if (isinf(db)) {
 		snprintf(buf, len, "-inf");
-	else
-		snprintf(buf, len, "%.1f", fabs(db) < 0.05 ? 0.0 : db);
+	} else {
+		double zero = 0.5 * pow(10.0, -decimals);
+
+		snprintf(buf, len, "%.*f", decimals,
+			 fabs(db) < zero ? 0.0 : db);
+	}
+}
+
+/*
+ * Two different gains in words: one decimal, or as many more (up to four)
+ * as it takes for the two texts to differ, then the raw values, so that a
+ * change too small for one decimal is still listed, and listed as a change.
+ * False when the gains are equal.
+ */
+static bool gain_change(uint32_t from, uint32_t to, char *x, char *y,
+			size_t len)
+{
+	if (from == to)
+		return false;
+	for (int decimals = 1; decimals <= 4; decimals++) {
+		db_text(from, decimals, x, len);
+		db_text(to, decimals, y, len);
+		if (strcmp(x, y) != 0)
+			return true;
+	}
+	/* below 0.0001 dB: the raw values say it */
+	size_t nx = strlen(x), ny = strlen(y);
+
+	snprintf(x + nx, len - nx, " (raw %lu)", (unsigned long)from);
+	snprintf(y + ny, len - ny, " (raw %lu)", (unsigned long)to);
+	return true;
 }
 
 /* A pan position as the panel shows it: "C", "L<n>" or "R<n>". */
@@ -917,7 +947,7 @@ size_t ua1000_state_describe_changes(const struct ua1000_state *from,
 						   "OUTPUT (DM off)" };
 	const struct ua1000_panel *a = &from->panel, *b = &to->panel;
 	struct changes c = { out, len, 0, 0, max_lines };
-	char x[16], y[16];
+	char x[40], y[40];
 
 	if (len == 0)
 		return 0;
@@ -959,9 +989,7 @@ size_t ua1000_state_describe_changes(const struct ua1000_state *from,
 				&from->mixer[m].strip[ch];
 			const struct ua1000_strip *t = &to->mixer[m].strip[ch];
 
-			db_text(s->gain, x, sizeof(x));
-			db_text(t->gain, y, sizeof(y));
-			if (strcmp(x, y) != 0)
+			if (gain_change(s->gain, t->gain, x, y, sizeof(x)))
 				change(&c, "%s %u: gain %s \u2192 %s dB\n",
 				       mixer_name[m], ch + 1, x, y);
 			pan_text(s->pan, x, sizeof(x));
@@ -975,9 +1003,8 @@ size_t ua1000_state_describe_changes(const struct ua1000_state *from,
 		}
 	}
 	for (unsigned int side = 0; side < 2; side++) {
-		db_text(from->monitor_gain[side], x, sizeof(x));
-		db_text(to->monitor_gain[side], y, sizeof(y));
-		if (strcmp(x, y) != 0)
+		if (gain_change(from->monitor_gain[side],
+				to->monitor_gain[side], x, y, sizeof(x)))
 			change(&c, "MONITOR OUT %s: gain %s \u2192 %s dB\n",
 			       side == UA1000_LEFT ? "L" : "R", x, y);
 	}
@@ -1123,7 +1150,8 @@ static bool number(struct line *l, unsigned long min, unsigned long max,
 		return fail(l, "missing number");
 	errno = 0;
 	*value = strtoul(w, &end, 10);
-	if (errno || *end || w[0] == '-' || *value < min || *value > max) {
+	if (errno || *end || w[0] < '0' || w[0] > '9' || *value < min ||
+	    *value > max) {
 		/* Not "return fail()": the analyzer does not follow a variadic
 		 * call, and would then index with an unchecked value. */
 		(void)fail(l, "\"%s\" is not a number in %lu..%lu", w, min,
@@ -1139,7 +1167,8 @@ static bool boolean(struct line *l, const char *on, const char *off,
 {
 	const char *w = word(l);
 
-	*value = false;
+	/* *value is changed only by a valid word: a refused line leaves the
+	 * state as it was */
 	if (w && strcmp(w, on) == 0)
 		*value = true;
 	else if (w && strcmp(w, off) == 0)

@@ -516,6 +516,12 @@ static void fader_point(const struct desk_fader *f, double value, double *x,
 	*y = f->yb + (f->yt - f->yb) * frac;
 }
 
+/* The house amber of the keyboard focus ring (caps, buttons, knobs). */
+static void set_focus_amber(cairo_t *cr)
+{
+	cairo_set_source_rgba(cr, 0.85, 0.54, 0.23, 0.9);
+}
+
 /*
  * A fader's cap at its scale's value, on whole pixels, and the amber focus
  * ring round the cap while the scale has visible focus (paint_focus()
@@ -531,7 +537,7 @@ static void paint_cap(cairo_t *cr, const struct desk_cap *cap,
 				 round(y - cap->ay));
 	cairo_paint(cr);
 	if (gtk_widget_has_visible_focus(scale)) {
-		cairo_set_source_rgba(cr, 0.85, 0.54, 0.23, 0.9);
+		set_focus_amber(cr);
 		cairo_set_line_width(cr, 2.0);
 		cairo_rectangle(cr, round(x - cap->ax) - 2,
 				round(y - cap->ay) - 2, cap->w + 4, cap->h + 4);
@@ -694,7 +700,7 @@ static void paint_focus(cairo_t *cr, GtkWidget *focus, GtkWidget *fixed)
 	    !gtk_widget_is_ancestor(focus, fixed) ||
 	    !gtk_widget_compute_bounds(focus, fixed, &r))
 		return;
-	cairo_set_source_rgba(cr, 0.85, 0.54, 0.23, 0.9); /* the house amber */
+	set_focus_amber(cr);
 	cairo_set_line_width(cr, 2.0);
 	cairo_rectangle(cr, r.origin.x - 2, r.origin.y - 2, r.size.width + 4,
 			r.size.height + 4);
@@ -981,13 +987,30 @@ static void on_knob_drag_update(GtkGestureDrag *g, double dx, double dy,
 			    round(k->start + (dx - dy) / 4.0));
 }
 
-/* "scroll" on a knob: one step per event, up turning clockwise. */
+/*
+ * "scroll" on a knob, up turning clockwise: a wheel's notch (dy of 1) is a
+ * step; a touchpad's smooth scroll, in fractions, adds up per knob until it
+ * makes a whole step; an event with no vertical movement does nothing.
+ */
 static gboolean on_knob_scroll(GtkEventControllerScroll *c, double dx,
 			       double dy, gpointer data)
 {
+	double *acc = g_object_get_data(G_OBJECT(data), "scroll-acc");
+	double steps;
+
 	(void)c;
 	(void)dx;
-	pan_step(data, dy < 0 ? 1 : -1);
+	if (!acc) {
+		acc = g_new0(double, 1);
+		g_object_set_data_full(G_OBJECT(data), "scroll-acc", acc,
+				       g_free);
+	}
+	*acc -= dy;
+	steps = trunc(*acc);
+	if (steps != 0) {
+		pan_step(data, steps);
+		*acc -= steps;
+	}
 	return TRUE;
 }
 
@@ -1870,8 +1893,9 @@ void desk_refresh(struct app *app)
 		return;
 	/* app_refresh() calls this with app->refreshing set: the toggled
 	 * handlers return without editing the state */
-	gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d->clock[p->clock]),
-				     TRUE);
+	if ((unsigned int)p->clock < G_N_ELEMENTS(d->clock))
+		gtk_toggle_button_set_active(
+			GTK_TOGGLE_BUTTON(d->clock[p->clock]), TRUE);
 	gtk_toggle_button_set_active(
 		GTK_TOGGLE_BUTTON(d->dout[p->digital_out_adat ? 0 : 1]), TRUE);
 	gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d->mono), p->mono);

@@ -273,6 +273,8 @@ static bool accept_user_set(struct dialog *d)
 {
 	guint index = gtk_drop_down_get_selected(GTK_DROP_DOWN(d->rate));
 
+	if (index >= G_N_ELEMENTS(rates))
+		return false; /* nothing selected: the dialog stays */
 	/* The menu lists exactly the four rates; an ADAT refusal keeps the
 	 * dialog open, so another rate can be chosen. */
 	return app_store_user_set(d->app, rates[index]) ||

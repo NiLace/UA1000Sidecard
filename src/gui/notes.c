@@ -42,6 +42,32 @@ static void notes_path(const struct app *app, char *path, size_t len)
 }
 
 /*
+ * Before the first save over a notes file that was not UTF-8: write its
+ * bytes, untouched, to "<path>.orig" (never over an existing one), so that
+ * nothing the file held is lost.  Returns false, with a notice, when that
+ * copy cannot be made: then the notes file is not replaced either.
+ */
+static bool keep_original(struct app *app, const char *path)
+{
+	struct notes_widgets *n = &app->notes;
+	gchar *orig = g_strdup_printf("%s.orig", path);
+	GError *error = NULL;
+	bool ok = true;
+
+	if (!g_file_test(orig, G_FILE_TEST_EXISTS) &&
+	    !g_file_set_contents(orig, n->original, (gssize)n->original_len,
+				 &error)) {
+		app_notice(app, error->message);
+		g_error_free(error);
+		ok = false;
+	}
+	if (ok)
+		g_clear_pointer(&n->original, g_free);
+	g_free(orig);
+	return ok;
+}
+
+/*
  * Write the note if it is unsaved, cancelling a pending timed save, and
  * create the directory if needed.  A failure is shown as a notice and the
  * note stays unsaved, so the next change or close tries again.
@@ -64,6 +90,8 @@ static void save_now(struct app *app)
 	dir = g_path_get_dirname(path);
 	g_mkdir_with_parents(dir, 0700);
 	g_free(dir);
+	if (n->original && !keep_original(app, path))
+		return; /* not saved: the original would be lost */
 	gtk_text_buffer_get_bounds(n->buffer, &start, &end);
 	text = gtk_text_buffer_get_text(n->buffer, &start, &end, FALSE);
 	/* g_file_set_contents() writes a temporary file and renames it */
@@ -125,8 +153,9 @@ static void on_destroy(GtkWidget *window, gpointer data)
 
 /*
  * Fill the buffer from the notes file.  A missing file is an empty note; a
- * file that is not UTF-8 is not shown, and not overwritten until the user
- * types; another error is shown as a notice.  The buffer starts saved.
+ * file that is not UTF-8 is shown read as Latin-1 (which any bytes are), and
+ * its bytes are kept so that the first save first copies them, untouched, to
+ * "notes.orig"; another error is shown as a notice.  The buffer starts saved.
  */
 static void load(struct app *app)
 {
@@ -137,13 +166,27 @@ static void load(struct app *app)
 
 	notes_path(app, path, sizeof(path));
 	if (g_file_get_contents(path, &text, &len, &error)) {
-		if (g_utf8_validate(text, (gssize)len, NULL))
+		if (g_utf8_validate(text, (gssize)len, NULL)) {
 			gtk_text_buffer_set_text(app->notes.buffer, text,
 						 (int)len);
-		else
-			app_notice(app, "The notes file is not UTF-8 text: "
-					"it was left as it is.");
-		g_free(text);
+			g_free(text);
+		} else {
+			gchar *shown = g_convert(text, (gssize)len, "UTF-8",
+						 "ISO-8859-1", NULL, NULL,
+						 NULL);
+
+			gtk_text_buffer_set_text(app->notes.buffer,
+						 shown ? shown : "", -1);
+			g_free(shown);
+			g_free(app->notes.original);
+			app->notes.original = text; /* kept for notes.orig */
+			app->notes.original_len = len;
+			app_notice(app,
+				   "The notes file is not UTF-8 text: it is "
+				   "shown read as Latin-1, and the first "
+				   "save keeps the file as it was in "
+				   "notes.orig.");
+		}
 	} else {
 		if (!g_error_matches(error, G_FILE_ERROR, G_FILE_ERROR_NOENT))
 			app_notice(app, error->message);
@@ -308,8 +351,9 @@ void notes_present(struct app *app)
 	gtk_widget_grab_focus(view);
 }
 
-/* Write the note now if it is unsaved. */
+/* Write the note now if it is unsaved; forget a kept original. */
 void notes_shutdown(struct app *app)
 {
 	save_now(app);
+	g_clear_pointer(&app->notes.original, g_free);
 }

@@ -61,7 +61,9 @@ static char *format_gain(GtkScale *scale, double position, gpointer data)
 
 	(void)scale;
 	(void)data;
-	db = ua1000_gain_to_db(ua1000_fader_to_gain((unsigned int)position));
+	/* rounded as fader_get_gain() rounds what is sent */
+	db = ua1000_gain_to_db(
+		ua1000_fader_to_gain((unsigned int)lround(position)));
 	if (isinf(db))
 		return g_strdup("-inf");
 	return g_strdup_printf("%+.1f", fabs(db) < 0.05 ? 0.0 : db);
